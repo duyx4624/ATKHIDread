@@ -1,0 +1,58 @@
+{
+  "id": "atk_mouse_battery",
+  "meta": {
+    "name": "鼠标电量",
+    "version": "1.0",
+    "author": "dauroar",
+    "description": "通过本地 hidread 服务读取 ATK X1 Ultimate 2.0（2.4G）电量；低电量自动变红"
+  },
+  "inputs": [
+    {
+      "key": "port",
+      "label": "服务端口",
+      "type": "text",
+      "default": "8731",
+      "scope": "target"
+    }
+  ],
+  "execution": {
+    "type": "chain",
+    "interval": 30,
+    "steps": [
+      {
+        "id": "battery",
+        "url": "http://127.0.0.1:{{port}}/battery",
+        "method": "GET",
+        "response_format": "json",
+        "cache_minutes": 0,
+        "extract": {
+          "level": "battery.level",
+          "display": "battery.level_text",
+          "mode": "device.mode"
+        },
+        "process": [
+          {
+            "var": "color_state",
+            "source": "level",
+            "function": "threshold_switch",
+            "value_map": {
+              "0": "2",
+              "30": "1",
+              "60": "0"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "outputs": [
+    {
+      "key": "main",
+      "label": "鼠标",
+      "short_label": "M",
+      "format_val": "{{display ?? '--'}}",
+      "unit": "%",
+      "color": "{{color_state}}"
+    }
+  ]
+}
