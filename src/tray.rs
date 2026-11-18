@@ -14,13 +14,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub fn run(url: String) -> Result<()> {
     let menu = Menu::new();
-    let open = MenuItem::new("打开状态页", true, None);
+    let open = MenuItem::new("打开设置页", true, None);
     let sep = PredefinedMenuItem::separator();
+    let restart = MenuItem::new("重启服务", true, None);
     let quit = MenuItem::new("退出", true, None);
-    menu.append_items(&[&open, &sep, &quit])
+    menu.append_items(&[&open, &sep, &restart, &quit])
         .context("构建托盘菜单失败")?;
 
     let open_id = open.id().clone();
+    let restart_id = restart.id().clone();
     let quit_id = quit.id().clone();
 
     let _tray = TrayIconBuilder::new()
@@ -37,6 +39,10 @@ pub fn run(url: String) -> Result<()> {
         while let Ok(ev) = rx.recv() {
             if ev.id == open_id {
                 open_url(&url_cl);
+            } else if ev.id == restart_id {
+                if let Err(e) = crate::restart() {
+                    eprintln!("手动重启失败：{e:#}");
+                }
             } else if ev.id == quit_id {
                 std::process::exit(0);
             }

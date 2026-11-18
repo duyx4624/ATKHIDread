@@ -72,11 +72,20 @@ impl Config {
         cfg.apply_env();
         cfg.apply_args(args)?;
 
+        // 相对路径一律基于 exe 所在目录：保证"数据全部在软件文件夹里"，
+        // 也不会因为从别处启动而把数据散落到当前工作目录。
+        if cfg.data_dir.is_relative() {
+            if let Some(dir) = config_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                cfg.data_dir = dir.join(&cfg.data_dir);
+            }
+        }
         cfg.data_dir = resolve_data_dir(&cfg.data_dir);
+        // 统一成绝对路径：自启注册、日志位置都依赖它
+        cfg.data_dir = std::path::absolute(&cfg.data_dir).unwrap_or(cfg.data_dir);
         Ok(cfg)
     }
 
-    fn apply_json(&mut self, v: &Value) {
+    pub fn apply_json(&mut self, v: &Value) {
         if let Some(s) = v.get("bind").and_then(Value::as_str) {
             self.bind = s.to_string();
         }
@@ -165,7 +174,8 @@ impl Config {
             }
         }
         if let Ok(v) = std::env::var("HIDREAD_DATA_DIR") {
-            self.data_dir = PathBuf::from(v);
+            // 环境变量按当前工作目录解释
+            self.data_dir = std::path::absolute(&v).unwrap_or_else(|_| PathBuf::from(v));
         }
     }
 
@@ -192,7 +202,11 @@ impl Config {
                 "--bind" => self.bind = take(val)?,
                 "--tick" => self.tick_s = take(val)?.parse::<u64>()?.max(5),
                 "--ttl" => self.cache_ttl_s = take(val)?.parse()?,
-                "--data-dir" => self.data_dir = PathBuf::from(take(val)?),
+                "--data-dir" => {
+                    // 命令行显式指定的路径按当前工作目录解释（和大多数 CLI 一致）
+                    let raw = take(val)?;
+                    self.data_dir = std::path::absolute(&raw).unwrap_or_else(|_| PathBuf::from(raw));
+                }
                 "--log" => self.log_file = Some(PathBuf::from(take(val)?)),
                 "--vid" => {
                     self.vid = parse_hex_u16(&take(val)?).context("--vid 需要十六进制")?
@@ -228,6 +242,119 @@ impl Config {
         Ok(())
     }
 
+    /// 只读配置文件（忽略 CLI / 环境变量），设置页编辑的就是这一份。
+    pub fn load_file_only() -> Self {
+        let mut cfg = Config::default();
+        if let Some(v) = read_config_file() {
+            cfg.apply_json(&v);
+        }
+        cfg
+    }
+
+    /// 校验设置页提交的**原始**值。
+    ///
+    /// 必须在 `apply_json` 之前调用：`apply_json` 对配置文件是防御性 clamp，
+    /// 但用于用户输入时会静默改写（`tick_s=1` 变 5、`port=70000` 截成 4464），
+    /// 那等于骗用户"保存成功了"。
+    pub fn check_raw(v: &Value) -> Result<()> {
+        let num = |key: &str| v.get(key).and_then(Value::as_u64);
+
+        if let Some(n) = num("port") {
+            if n == 0 || n > 65535 {
+                anyhow::bail!("端口应在 1–65535 之间");
+            }
+        }
+        if let Some(n) = num("tick_s") {
+            if !(5..=3600).contains(&n) {
+                anyhow::bail!("采样节拍应在 5–3600 秒之间");
+            }
+        }
+        if let Some(n) = num("cache_ttl_s") {
+            if !(1..=3600).contains(&n) {
+                anyhow::bail!("缓存有效期应在 1–3600 秒之间");
+            }
+        }
+        if let Some(n) = num("offline_after_fails") {
+            if !(1..=10).contains(&n) {
+                anyhow::bail!("判定离线所需失败次数应在 1–10 之间");
+            }
+        }
+        if let Some(n) = num("history_interval_s") {
+            if !(10..=86_400).contains(&n) {
+                anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
+            }
+        }
+        if let Some(n) = num("history_days") {
+            if !(1..=365).contains(&n) {
+                anyhow::bail!("历史保留天数应在 1–365 之间");
+            }
+        }
+        if let Some(n) = num("cycle_full_level") {
+            if !(1..=100).contains(&n) {
+                anyhow::bail!("满充判定电量应在 1–100 之间");
+            }
+        }
+        if let Some(n) = num("cycle_min_charge_min") {
+            if n > 600 {
+                anyhow::bail!("最短充电时长不应超过 600 分钟");
+            }
+        }
+        if let Some(n) = num("cycle_end_level") {
+            if n > 99 {
+                anyhow::bail!("周期结束电量应在 0–99 之间");
+            }
+        }
+        if let Some(n) = num("cycle_dead_hours") {
+            if !(1..=720).contains(&n) {
+                anyhow::bail!("失联判定时长应在 1–720 小时之间");
+            }
+        }
+        if let Some(n) = num("read_timeout_ms") {
+            if !(10..=5000).contains(&n) {
+                anyhow::bail!("单次读超时应在 10–5000 ms 之间");
+            }
+        }
+        if let Some(n) = num("read_deadline_ms") {
+            if !(50..=10_000).contains(&n) {
+                anyhow::bail!("单轮预算应在 50–10000 ms 之间");
+            }
+        }
+        if let Some(n) = num("retries") {
+            if !(1..=10).contains(&n) {
+                anyhow::bail!("重试次数应在 1–10 之间");
+            }
+        }
+
+        if let Some(arr) = v.get("pids") {
+            let Some(list) = arr.as_array() else {
+                anyhow::bail!("PID 列表必须是数组");
+            };
+            if list.is_empty() {
+                anyhow::bail!("至少需要一个 PID");
+            }
+            for item in list {
+                let ok = match item {
+                    Value::String(s) => parse_hex_u16(s).is_some(),
+                    Value::Number(n) => n.as_u64().map(|x| x <= 0xFFFF).unwrap_or(false),
+                    _ => false,
+                };
+                if !ok {
+                    anyhow::bail!("PID 列表里有无法解析的值：{item}");
+                }
+            }
+        }
+
+        for key in ["vid", "usage_page"] {
+            if let Some(s) = v.get(key).and_then(Value::as_str) {
+                if parse_hex_u16(s).is_none() {
+                    anyhow::bail!("{key} 必须是十六进制，例如 373B");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// 历史 CSV 的路径。
     pub fn history_path(&self, date: &str) -> PathBuf {
         self.data_dir.join(format!("history-{date}.csv"))
@@ -252,6 +379,98 @@ impl Config {
     pub fn cycle_state_path(&self) -> PathBuf {
         self.data_dir.join("cycle-state.json")
     }
+
+    /// 设置页展示/回传用的 JSON（键名与 config.json 一致）。
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "bind": self.bind,
+            "port": self.port,
+            "tick_s": self.tick_s,
+            "cache_ttl_s": self.cache_ttl_s,
+            "offline_after_fails": self.offline_after_fails,
+            "history_interval_s": self.history_interval_s,
+            "history_days": self.history_days,
+            "cycle_full_level": self.cycle_full_level,
+            "cycle_min_charge_min": self.cycle_min_charge_min,
+            "cycle_end_level": self.cycle_end_level,
+            "cycle_dead_hours": self.cycle_dead_hours,
+            "vid": format!("{:04X}", self.vid),
+            "pids": self.pids.iter().map(|p| format!("{p:04X}")).collect::<Vec<_>>(),
+            "usage_page": format!("{:04X}", self.usage_page),
+            "read_timeout_ms": self.read_timeout_ms,
+            "read_deadline_ms": self.read_deadline_ms,
+            "retries": self.retries,
+            "data_dir": self.data_dir.display().to_string(),
+            "tray": self.tray,
+        })
+    }
+
+    /// 保存到 exe 同目录的 `config.json`（读取时也是优先这个位置）。
+    pub fn save(&self) -> Result<std::path::PathBuf> {
+        let path = config_path().context("无法定位 exe 所在目录")?;
+        std::fs::write(&path, serde_json::to_vec_pretty(&self.to_json())?)
+            .with_context(|| format!("写入 {} 失败", path.display()))?;
+        Ok(path)
+    }
+
+    /// 校验设置页提交的值；`current_port` 用于判断端口是否真的变了。
+    pub fn validate(&self, current_port: u16) -> Result<()> {
+        if self.tick_s < 5 || self.tick_s > 3600 {
+            anyhow::bail!("采样节拍应在 5–3600 秒之间");
+        }
+        if self.cache_ttl_s < 1 || self.cache_ttl_s > 3600 {
+            anyhow::bail!("缓存有效期应在 1–3600 秒之间");
+        }
+        if !(1..=10).contains(&self.offline_after_fails) {
+            anyhow::bail!("判定离线所需失败次数应在 1–10 之间");
+        }
+        if self.history_interval_s < 10 || self.history_interval_s > 86_400 {
+            anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
+        }
+        if !(1..=365).contains(&self.history_days) {
+            anyhow::bail!("历史保留天数应在 1–365 之间");
+        }
+        if self.cycle_full_level == 0 || self.cycle_full_level > 100 {
+            anyhow::bail!("满充判定电量应在 1–100 之间");
+        }
+        if self.cycle_end_level >= self.cycle_full_level {
+            anyhow::bail!("周期结束阈值必须小于满充阈值");
+        }
+        if self.cycle_min_charge_min > 600 {
+            anyhow::bail!("最短充电时长不应超过 600 分钟");
+        }
+        if !(1..=720).contains(&self.cycle_dead_hours) {
+            anyhow::bail!("失联判定时长应在 1–720 小时之间");
+        }
+        if self.bind.parse::<std::net::IpAddr>().is_err() {
+            anyhow::bail!("监听地址不是合法的 IP（例如 127.0.0.1）");
+        }
+        if self.port == 0 {
+            anyhow::bail!("端口不能为 0");
+        }
+        if self.port != current_port {
+            // 只有端口真的变了才试绑，避免把当前监听中的端口当成占用
+            if let Ok(addr) = format!("{}:{}", self.bind, self.port).parse::<std::net::SocketAddr>() {
+                if std::net::TcpListener::bind(addr).is_err() {
+                    anyhow::bail!("端口 {} 已被占用", self.port);
+                }
+            }
+        }
+        if self.pids.is_empty() {
+            anyhow::bail!("至少需要一个 PID");
+        }
+        if !(1..=10).contains(&self.retries) {
+            anyhow::bail!("重试次数应在 1–10 之间");
+        }
+        Ok(())
+    }
+}
+
+/// `config.json` 的首选位置（exe 同目录）。
+pub fn config_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config.json")))
 }
 
 fn read_config_file() -> Option<Value> {

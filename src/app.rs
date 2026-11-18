@@ -64,6 +64,8 @@ enum TickResult {
 
 pub struct App {
     pub cfg: Config,
+    /// 配置文件里的值（不含 CLI/环境变量覆盖），设置页读写这一份
+    pub settings: Config,
     pub started: DateTime<Local>,
     inner: Mutex<Inner>,
     device: Mutex<Option<Opened>>,
@@ -72,7 +74,8 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config) -> Self {
         let started = Local::now();
-        let inner = Inner {
+        let settings = Config::load_file_only();
+        let mut inner = Inner {
             snapshot: Snapshot {
                 level: None,
                 wired: false,
@@ -97,8 +100,12 @@ impl App {
             refreshing: false,
         };
 
+        // 重启后立刻能画出 24h 曲线，不用等重新攒点
+        let _ = inner.history.preload(&cfg);
+
         Self {
             cfg,
+            settings,
             started,
             inner: Mutex::new(inner),
             device: Mutex::new(None),
@@ -415,6 +422,11 @@ impl App {
     pub fn daily_json(&self, days: i64) -> Value {
         let g = self.inner.lock().unwrap();
         json!({ "days": g.sessions.daily(&self.cfg, days) })
+    }
+
+    pub fn usage_json(&self, days: i64) -> Value {
+        let g = self.inner.lock().unwrap();
+        json!({ "days": g.sessions.usage(&self.cfg, days) })
     }
 
     pub fn history_json(&self, hours: i64) -> Value {

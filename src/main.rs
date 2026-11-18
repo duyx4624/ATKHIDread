@@ -14,6 +14,7 @@ mod tray;
 mod util;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,7 +77,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         redirect_output(&cfg.data_dir.join("hidread.log"));
     }
 
-    if !acquire_single_instance()? {
+    if !acquire_single_instance(restart_wait_ms())? {
         eprintln!("hidread 已经在运行，本次启动直接退出");
         return Ok(());
     }
@@ -474,17 +475,59 @@ fn redirect_output(path: &Path) {
 }
 
 /// 命名互斥量保证只跑一份，避免两个进程抢同一个设备的输入队列。
-fn acquire_single_instance() -> Result<bool> {
+/// 重启时新进程会等旧进程释放互斥量，所以这里允许等待一小段时间。
+static SINGLETON: AtomicIsize = AtomicIsize::new(0);
+
+fn restart_wait_ms() -> u64 {
+    if std::env::var_os("HIDREAD_RESTART").is_some() {
+        4000
+    } else {
+        0
+    }
+}
+
+fn acquire_single_instance(wait_ms: u64) -> Result<bool> {
     let name = wide(r"Local\hidread-singleton");
-    unsafe {
-        let handle =
-            CreateMutexW(None, BOOL(1), PCWSTR(name.as_ptr())).context("创建互斥量失败")?;
-        let already = windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS;
-        if already {
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+
+    loop {
+        unsafe {
+            let handle =
+                CreateMutexW(None, BOOL(1), PCWSTR(name.as_ptr())).context("创建互斥量失败")?;
+            let already = windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS;
+            if !already {
+                SINGLETON.store(handle.0 as isize, Ordering::SeqCst);
+                return Ok(true);
+            }
             let _ = CloseHandle(handle);
+        }
+
+        if std::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        // HANDLE 是 Copy 的裸指针，离开作用域不会关闭；进程活着它就活着
-        Ok(true)
+        std::thread::sleep(Duration::from_millis(120));
     }
+}
+
+/// 重启自身：释放互斥量 → 拉起新进程（带 `HIDREAD_RESTART`）→ 退出。
+pub(crate) fn restart() -> Result<()> {
+    let exe = std::env::current_exe().context("定位 exe 失败")?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let handle = SINGLETON.swap(0, Ordering::SeqCst);
+    if handle != 0 {
+        unsafe {
+            let _ = CloseHandle(HANDLE(handle as *mut core::ffi::c_void));
+        }
+    }
+    // 给系统一点时间销毁互斥量对象
+    std::thread::sleep(Duration::from_millis(150));
+
+    std::process::Command::new(&exe)
+        .args(&args)
+        .env("HIDREAD_RESTART", "1")
+        .spawn()
+        .with_context(|| format!("启动新实例失败：{}", exe.display()))?;
+
+    std::process::exit(0);
 }

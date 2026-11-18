@@ -194,6 +194,67 @@ impl SessionStore {
         out
     }
 
+    /// 最近 `days` 天，每小时在线多少分钟（0–60）。用于"课程表"热力图。
+    ///
+    /// 按会话区间与小时窗口求交集，而不是数采样点——采样点受节拍与休眠影响，
+    /// 会系统性低估真实在线分钟数。
+    pub fn usage(&self, cfg: &Config, days: i64) -> Vec<Value> {
+        let now = Local::now();
+        let today = now.date_naive();
+
+        let mut spans: Vec<(i64, i64)> = util::read_rows(&cfg.sessions_path())
+            .into_iter()
+            .filter(|r| r.len() >= 7 && r[0] != "session_id")
+            .filter_map(|r| {
+                let s = r[2].parse::<i64>().ok()?;
+                let e = r[4].parse::<i64>().ok()?;
+                Some((s, e))
+            })
+            .collect();
+        if let Some(s) = &self.open {
+            spans.push((s.wake_at.timestamp(), now.timestamp()));
+        }
+
+        let mut out = Vec::new();
+        for offset in (0..days.max(1)).rev() {
+            let day = today - ChronoDuration::days(offset);
+            let Some(start) = day
+                .and_hms_opt(0, 0, 0)
+                .and_then(|d| d.and_local_timezone(Local).single())
+            else {
+                continue;
+            };
+            let d0 = start.timestamp();
+            let d1 = d0 + 86_400;
+            let mut hours = [0i64; 24];
+
+            for (s, e) in &spans {
+                let a = (*s).max(d0);
+                let b = (*e).min(d1);
+                if b <= a {
+                    continue;
+                }
+                for (h, slot) in hours.iter_mut().enumerate() {
+                    let hs = d0 + h as i64 * 3600;
+                    let x = a.max(hs);
+                    let y = b.min(hs + 3600);
+                    if y > x {
+                        *slot += (y - x) / 60;
+                    }
+                }
+            }
+
+            let total_s = hours.iter().sum::<i64>() * 60;
+            out.push(json!({
+                "date": day.format("%Y-%m-%d").to_string(),
+                "hours": hours.to_vec(),
+                "total_s": total_s,
+            }));
+        }
+
+        out
+    }
+
     /// 最近 `days` 天的每日聚合（含今天）。
     pub fn daily(&self, cfg: &Config, days: i64) -> Vec<Value> {
         let now = Local::now();

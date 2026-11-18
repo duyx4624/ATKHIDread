@@ -76,6 +76,29 @@ impl History {
         Ok(true)
     }
 
+    /// 启动时把最近 24h 的磁盘数据灌回内存环形缓冲。
+    ///
+    /// 否则进程一重启，`/history?hours<=24` 就读内存、返回空，
+    /// 曲线要等重新攒够采样点才出现。
+    pub fn preload(&mut self, cfg: &Config) -> Result<()> {
+        let now = Local::now();
+        let from = now - ChronoDuration::hours(24);
+        let points = Self::load_range(cfg, from, now);
+
+        if let Some(last) = points.last() {
+            self.last_level = last.level;
+            self.last_online = Some(last.online);
+            self.last_write = Some(last.at);
+        }
+        for p in points {
+            self.ring.push_back(p);
+        }
+        while self.ring.len() > 1500 {
+            self.ring.pop_front();
+        }
+        Ok(())
+    }
+
     /// 最近 24h 的内存数据。
     pub fn ring(&self) -> &VecDeque<Point> {
         &self.ring
