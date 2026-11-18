@@ -1,24 +1,42 @@
+// 双击运行时不要弹出黑窗口；从终端启动时再把父控制台挂回来。
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod app;
 mod atk;
+mod autostart;
 mod config;
 mod cycle;
 mod hid;
 mod history;
 mod http;
 mod session;
+mod tray;
 mod util;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use serde_json::Value;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, BOOL, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows::Win32::System::Console::{
+    AttachConsole, GetConsoleWindow, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+    STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::app::App;
 use crate::config::{Config, WIRED_PID};
 
 fn main() {
+    setup_console();
+
     if let Err(e) = run() {
         eprintln!("错误：{e:#}");
         std::process::exit(1);
@@ -39,6 +57,9 @@ fn run() -> Result<()> {
         "cycles" => cmd_cycles(rest),
         "daily" => cmd_daily(rest),
         "history" => cmd_history(rest),
+        "autostart" => cmd_autostart(rest),
+        "--install-autostart" => cmd_autostart(&[String::from("install")]),
+        "--uninstall-autostart" => cmd_autostart(&[String::from("uninstall")]),
         "--help" | "-h" | "help" => {
             println!("{}", config::HELP);
             Ok(())
@@ -49,12 +70,24 @@ fn run() -> Result<()> {
 
 fn cmd_serve(args: &[String]) -> Result<()> {
     let cfg = Config::load(args)?;
+
+    // 无控制台（双击启动）→ 日志写文件，避免日志凭空消失
+    if !has_console() {
+        redirect_output(&cfg.data_dir.join("hidread.log"));
+    }
+
+    if !acquire_single_instance()? {
+        eprintln!("hidread 已经在运行，本次启动直接退出");
+        return Ok(());
+    }
+
     history::History::purge(&cfg);
 
     let app = Arc::new(App::new(cfg.clone()));
-
-    // 冷启动预热：先读一次，避免首个请求拿到空值
     app.warmup();
+
+    // 先绑定端口：端口被占用时立即失败，而不是静默跑在后台
+    let server = http::bind(&app)?;
 
     let ticker = Arc::clone(&app);
     let tick_s = cfg.tick_s.max(5);
@@ -65,7 +98,32 @@ fn cmd_serve(args: &[String]) -> Result<()> {
             ticker.tick();
         })?;
 
-    http::serve(app)
+    let http_app = Arc::clone(&app);
+    std::thread::Builder::new()
+        .name("hidread-http".into())
+        .spawn(move || {
+            if let Err(e) = http::run(server, http_app) {
+                eprintln!("HTTP 服务退出：{e:#}");
+            }
+        })?;
+
+    let url = format!("http://{}:{}", cfg.bind, cfg.port);
+    if cfg.tray {
+        if let Err(e) = tray::run(url) {
+            eprintln!("托盘不可用（{e:#}），转为纯后台运行");
+            park();
+        }
+    } else {
+        park();
+    }
+    Ok(())
+}
+
+/// 主线程停住（没有托盘时）。
+fn park() {
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 fn cmd_once(args: &[String]) -> Result<()> {
@@ -251,11 +309,7 @@ fn cmd_history(args: &[String]) -> Result<()> {
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(7);
     let now = Local::now();
-    let points = history::History::load_range(
-        &cfg,
-        now - chrono::Duration::days(days),
-        now,
-    );
+    let points = history::History::load_range(&cfg, now - chrono::Duration::days(days), now);
 
     println!("ts,ts_unix,level,wired,link,read_ms");
     for p in points {
@@ -268,6 +322,34 @@ fn cmd_history(args: &[String]) -> Result<()> {
             if p.online { "online" } else { "offline" },
             p.read_ms
         );
+    }
+    Ok(())
+}
+
+fn cmd_autostart(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str).unwrap_or("status") {
+        "install" | "on" => {
+            let cfg = Config::load(&[])?;
+            let cmd = autostart::install(&cfg.data_dir)?;
+            println!("已写入开机自启（仅当前用户）：");
+            println!("  {cmd}");
+            println!("撤销：hidread autostart uninstall");
+        }
+        "uninstall" | "off" => {
+            if autostart::uninstall()? {
+                println!("已移除开机自启");
+            } else {
+                println!("本来就没有自启项");
+            }
+        }
+        "status" => match autostart::status()? {
+            Some(cmd) => {
+                println!("已启用：");
+                println!("  {cmd}");
+            }
+            None => println!("未启用（hidread autostart install 可开启）"),
+        },
+        other => bail!("未知动作 `{other}`，可用：install | uninstall | status"),
     }
     Ok(())
 }
@@ -324,5 +406,85 @@ fn num(v: &Value) -> String {
         "--".into()
     } else {
         v.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows 外壳：控制台、单实例
+// ---------------------------------------------------------------------------
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 从终端启动时把父控制台挂回来（双击启动时这里会失败，属预期）。
+fn setup_console() {
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+            let name = wide("CONOUT$");
+            if let Ok(h) = CreateFileW(
+                PCWSTR(name.as_ptr()),
+                (windows::Win32::Foundation::GENERIC_READ
+                    | windows::Win32::Foundation::GENERIC_WRITE)
+                    .0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            ) {
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+        }
+    }
+}
+
+fn has_console() -> bool {
+    unsafe { !GetConsoleWindow().0.is_null() }
+}
+
+/// 无控制台时把 stdout/stderr 重定向到日志文件；超过 2 MB 就重开一个。
+fn redirect_output(path: &Path) {
+    use std::os::windows::io::AsRawHandle;
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::metadata(path)
+        .map(|m| m.len() > 2 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let raw = f.as_raw_handle();
+        unsafe {
+            let _ = SetStdHandle(STD_ERROR_HANDLE, HANDLE(raw));
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, HANDLE(raw));
+        }
+        // 句柄交给标准输出，进程生命周期内不关闭
+        std::mem::forget(f);
+    }
+}
+
+/// 命名互斥量保证只跑一份，避免两个进程抢同一个设备的输入队列。
+fn acquire_single_instance() -> Result<bool> {
+    let name = wide(r"Local\hidread-singleton");
+    unsafe {
+        let handle =
+            CreateMutexW(None, BOOL(1), PCWSTR(name.as_ptr())).context("创建互斥量失败")?;
+        let already = windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS;
+        if already {
+            let _ = CloseHandle(handle);
+            return Ok(false);
+        }
+        // HANDLE 是 Copy 的裸指针，离开作用域不会关闭；进程活着它就活着
+        Ok(true)
     }
 }

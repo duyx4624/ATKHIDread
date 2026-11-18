@@ -30,6 +30,8 @@ pub struct Config {
     pub retries: u32,
     pub data_dir: PathBuf,
     pub log_file: Option<PathBuf>,
+    /// 是否显示托盘图标（`--no-tray` 关闭，用于无桌面环境）
+    pub tray: bool,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             retries: 3,
             data_dir: PathBuf::from("data"),
             log_file: None,
+            tray: true,
         }
     }
 }
@@ -145,6 +148,9 @@ impl Config {
         if let Some(s) = v.get("log_file").and_then(Value::as_str) {
             self.log_file = Some(PathBuf::from(s));
         }
+        if let Some(b) = v.get("tray").and_then(Value::as_bool) {
+            self.tray = b;
+        }
     }
 
     fn apply_env(&mut self) {
@@ -167,6 +173,14 @@ impl Config {
         let mut i = 0;
         while i < args.len() {
             let key = args[i].as_str();
+
+            // 无值开关，单独处理（不能按 key+value 跳过两项）
+            if key == "--no-tray" {
+                self.tray = false;
+                i += 1;
+                continue;
+            }
+
             let val = args.get(i + 1).map(String::as_str);
             let take = |v: Option<&str>| -> Result<String> {
                 v.map(|s| s.to_string())
@@ -314,6 +328,8 @@ hidread —— ATK 2.4G 鼠标电量桥接服务
   hidread sessions [--day D]  打印当日会话
   hidread cycles [--limit N]  打印放电周期
   hidread daily [--days N]    打印每日使用表
+  hidread autostart [install|uninstall|status]
+                              开机自启（写 HKCU Run，无需管理员）
 
 选项：
   --port <N>        监听端口（默认 8731）
@@ -321,6 +337,7 @@ hidread —— ATK 2.4G 鼠标电量桥接服务
   --tick <秒>       采样节拍（默认 60）
   --interval <秒>   历史基线间隔（默认 300）
   --data-dir <路径> 数据目录（默认 ./data）
+  --no-tray         不显示托盘图标（纯后台）
   --vid <HEX>       USB VID（默认 373B）
   --pids <HEX,HEX>  两种模式的 PID（默认 11D9,11E7）
 ";

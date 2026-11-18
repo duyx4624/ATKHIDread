@@ -16,11 +16,11 @@ use crate::util;
 
 type Body = Response<Cursor<Vec<u8>>>;
 
-pub fn serve(app: Arc<App>) -> Result<()> {
+pub fn bind(app: &App) -> Result<Server> {
     let addr = format!("{}:{}", app.cfg.bind, app.cfg.port);
     let server = Server::http(&addr).map_err(|e| anyhow!("监听 {addr} 失败：{e}"))?;
 
-    println!(
+    eprintln!(
         "hidread 已启动：http://{addr}  tick={}s  vid={:04X}  pids={:?}  data={}",
         app.cfg.tick_s,
         app.cfg.vid,
@@ -28,6 +28,10 @@ pub fn serve(app: Arc<App>) -> Result<()> {
         app.cfg.data_dir.display()
     );
 
+    Ok(server)
+}
+
+pub fn run(server: Server, app: Arc<App>) -> Result<()> {
     for request in server.incoming_requests() {
         let path = request.url().to_string();
         let (route, q) = split_query(&path);
