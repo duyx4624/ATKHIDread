@@ -5,7 +5,6 @@
   "cache_ttl_s": 60,
   "offline_after_fails": 2,
   "history_interval_s": 300,
-  "history_days": 30,
   "cycle_full_level": 100,
   "cycle_min_charge_min": 20,
   "cycle_end_level": 10,
@@ -21,5 +20,6 @@
   "retries": 3,
   "data_dir": "data",
   "tray": true,
-  "sleep_s": 60
+  "sleep_s": 60,
+  "data_max_mb": 200
 }

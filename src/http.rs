@@ -57,7 +57,7 @@ pub fn run(server: Server, app: Arc<App>) -> Result<()> {
             json_resp(405, &json!({"error": "只支持 GET"}))
         } else {
             match route {
-                "/" => html_resp(SETTINGS_HTML.to_string()),
+                "/" => html_resp(SETTINGS_HTML.replace("{{VER}}", env!("CARGO_PKG_VERSION"))),
                 "/battery" => {
                     let (code, v) = app.battery_json();
                     json_resp(code, &v)
@@ -438,7 +438,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.err{background:var(--bad)}
 </style></head><body><div class="wrap">
-<header><h1>hidread</h1><span id="badge" class="badge">连接中…</span></header>
+<header><h1>hidread <small class="ver">v{{VER}}</small></h1><span id="badge" class="badge">连接中…</span></header>
 
 <section class="cards">
   <div class="card"><div class="k">电量</div><div class="v"><span id="level">--</span><small>%</small></div>
@@ -490,7 +490,8 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
   <fieldset><legend>记录</legend><div class="grid">
     <label>历史基线间隔（秒）<input type="number" data-key="history_interval_s" min="10" max="86400">
       <span class="hint">数值变化时会立即补点</span></label>
-    <label>历史保留天数<input type="number" data-key="history_days" min="1" max="365"></label>
+    <label>数据上限（MB）<input type="number" data-key="data_max_mb" min="16" max="10240">
+      <span class="hint">超过上限时从最旧的曲线/事件文件开始清理，最近 7 天始终保留</span></label>
   </div></fieldset>
 
   <fieldset><legend>放电周期</legend><div class="grid">
@@ -540,7 +541,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 <div id="modal"><div class="modal-box"><h3><span id="modal-title"></span><button id="modal-close" title="关闭">×</button></h3><div id="modal-body"></div></div></div>
 <div id="toast"></div>
 <script>
-const numKeys=new Set(['port','sleep_s','tick_s','cache_ttl_s','offline_after_fails','history_interval_s','history_days','cycle_full_level','cycle_min_charge_min','cycle_end_level','cycle_dead_hours','read_timeout_ms','read_deadline_ms','retries']);
+const numKeys=new Set(['port','sleep_s','tick_s','cache_ttl_s','offline_after_fails','history_interval_s','data_max_mb','cycle_full_level','cycle_min_charge_min','cycle_end_level','cycle_dead_hours','read_timeout_ms','read_deadline_ms','retries']);
 const fields=[...document.querySelectorAll('[data-key]')];
 const $=id=>document.getElementById(id);
 function toast(text,err){const t=$('toast');t.textContent=text;t.className='show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',4000);}

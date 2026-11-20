@@ -19,7 +19,8 @@ pub struct Config {
     /// 鼠标驱动里的休眠档位（秒）。判离线时会放宽到该时长 + 2 个节拍。
     pub sleep_s: u64,
     pub history_interval_s: u64,
-    pub history_days: i64,
+    /// 数据目录上限（MB）：超过后从最旧的按天文件开始清理
+    pub data_max_mb: u64,
     pub cycle_full_level: u8,
     pub cycle_min_charge_min: u64,
     pub cycle_end_level: u8,
@@ -46,7 +47,7 @@ impl Default for Config {
             offline_after_fails: 2,
             sleep_s: 60,
             history_interval_s: 300,
-            history_days: 30,
+            data_max_mb: 200,
             cycle_full_level: 100,
             cycle_min_charge_min: 20,
             cycle_end_level: 10,
@@ -110,8 +111,8 @@ impl Config {
         if let Some(n) = v.get("history_interval_s").and_then(Value::as_u64) {
             self.history_interval_s = n.max(10);
         }
-        if let Some(n) = v.get("history_days").and_then(Value::as_i64) {
-            self.history_days = n.max(1);
+        if let Some(n) = v.get("data_max_mb").and_then(Value::as_u64) {
+            self.data_max_mb = n.clamp(16, 10240);
         }
         if let Some(n) = v.get("cycle_full_level").and_then(Value::as_u64) {
             self.cycle_full_level = n.min(100) as u8;
@@ -296,9 +297,9 @@ impl Config {
                 anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
             }
         }
-        if let Some(n) = num("history_days") {
-            if !(1..=365).contains(&n) {
-                anyhow::bail!("历史保留天数应在 1–365 之间");
+        if let Some(n) = num("data_max_mb") {
+            if !(16..=10240).contains(&n) {
+                anyhow::bail!("数据上限应在 16–10240 MB 之间");
             }
         }
         if let Some(n) = num("cycle_full_level") {
@@ -402,7 +403,7 @@ impl Config {
             "cache_ttl_s": self.cache_ttl_s,
             "offline_after_fails": self.offline_after_fails,
             "history_interval_s": self.history_interval_s,
-            "history_days": self.history_days,
+            "data_max_mb": self.data_max_mb,
             "cycle_full_level": self.cycle_full_level,
             "cycle_min_charge_min": self.cycle_min_charge_min,
             "cycle_end_level": self.cycle_end_level,
@@ -440,7 +441,7 @@ impl Config {
         if self.history_interval_s < 10 || self.history_interval_s > 86_400 {
             anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
         }
-        if !(1..=365).contains(&self.history_days) {
+        if !(16..=10240).contains(&self.data_max_mb) {
             anyhow::bail!("历史保留天数应在 1–365 之间");
         }
         if self.cycle_full_level == 0 || self.cycle_full_level > 100 {

@@ -183,15 +183,26 @@ impl History {
         out
     }
 
-    /// 清理超过保留期的按天文件。
+    /// 清理按天文件：不再按天数，而是按数据目录总量（MB）。
+    ///
+    /// 从最旧的 `history-*.csv` / `events-*.csv` 开始删，直到回落到上限以内；
+    /// 最近 7 天永远保留，避免一次异常写入把当天数据也清掉。
+    /// `sessions.csv` / `cycles.csv` 这些累积文件不参与，删了会丢历史。
     pub fn purge(cfg: &Config) {
-        let keep_from = Local::now().date_naive() - ChronoDuration::days(cfg.history_days);
         let Ok(entries) = std::fs::read_dir(&cfg.data_dir) else {
             return;
         };
 
+        let mut files: Vec<(NaiveDate, std::path::PathBuf, u64)> = Vec::new();
+        let mut total = 0u64;
+        let mut others = 0u64;
+
         for entry in entries.flatten() {
             let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            let size = meta.len();
+            total += size;
+
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
@@ -199,16 +210,41 @@ impl History {
                 .strip_prefix("history-")
                 .or_else(|| name.strip_prefix("events-"))
             else {
+                others += size;
                 continue;
             };
             let Some(date_str) = rest.strip_suffix(".csv") else {
+                others += size;
                 continue;
             };
             if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                if date < keep_from {
-                    let _ = std::fs::remove_file(&path);
-                }
+                files.push((date, path, size));
+            } else {
+                others += size;
             }
         }
+
+        let limit = cfg.data_max_mb * 1024 * 1024;
+        if total <= limit {
+            return;
+        }
+
+        // 按日期升序，先删最旧的
+        files.sort_by_key(|(d, _, _)| *d);
+        let keep_from = Local::now().date_naive() - ChronoDuration::days(7);
+        let mut now_total = total;
+
+        for (date, path, size) in files {
+            if now_total <= limit {
+                break;
+            }
+            if date >= keep_from {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                now_total = now_total.saturating_sub(size);
+            }
+        }
+        let _ = others;
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hidread"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "ATK X1 Ultimate 2.0 电量读取与本地 HTTP 桥接服务"
 license = "MIT"
