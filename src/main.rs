@@ -487,7 +487,13 @@ fn restart_wait_ms() -> u64 {
 }
 
 fn acquire_single_instance(wait_ms: u64) -> Result<bool> {
-    let name = wide(r"Local\hidread-singleton");
+    // 允许通过 HIDREAD_INSTANCE 起多个实例（调试/并行测试用），默认仍是全局单例
+    let suffix = std::env::var("HIDREAD_INSTANCE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("-{v}"))
+        .unwrap_or_default();
+    let name = wide(&format!(r"Local\hidread-singleton{suffix}"));
     let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
 
     loop {

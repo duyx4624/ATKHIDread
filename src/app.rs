@@ -213,7 +213,10 @@ impl App {
     fn mark_failure(&self, now: DateTime<Local>) {
         let mut g = self.inner.lock().unwrap();
         g.link.fails += 1;
-        let threshold = self.cfg.offline_after_fails.max(1);
+        // 鼠标静态 1 分钟就会休眠，这属于正常使用而非离开：
+        // 判离线至少等到"休眠时长 + 2 个采样节拍"，否则每次休眠都会切断会话
+        let by_sleep = (self.cfg.sleep_s.div_ceil(self.cfg.tick_s.max(1)) + 2) as u32;
+        let threshold = self.cfg.offline_after_fails.max(by_sleep).max(1);
 
         if g.link.online && g.link.fails >= threshold {
             g.link.online = false;
@@ -424,28 +427,97 @@ impl App {
         json!({ "days": g.sessions.daily(&self.cfg, days) })
     }
 
+    /// 周视图：7 天的会话区间 + 自学习出来的时间轴范围。
+    pub fn week_json(&self, start: Option<&str>, days: i64) -> Value {
+        let now = Local::now();
+        let today = now.date_naive();
+        let days = days.clamp(1, 60);
+
+        let start_date = start
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| {
+                if days <= 7 {
+                    // 短跨度默认本周一
+                    let wd = chrono::Datelike::weekday(&today).num_days_from_monday() as i64;
+                    today - CDur::days(wd)
+                } else {
+                    // 长跨度默认滚动到今天
+                    today - CDur::days(days - 1)
+                }
+            });
+
+        let g = self.inner.lock().unwrap();
+        let (from_h, to_h) = g.sessions.active_range(&self.cfg, 30);
+
+        // 业务日：每天从 04:00 到次日 03:59
+        let day0 = start_date
+            .and_hms_opt(4, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).single())
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        let segs = g
+            .sessions
+            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now);
+
+        let mut days_out = Vec::new();
+        let mut total = 0i64;
+        for i in 0..days {
+            let d0 = day0 + i * 86_400;
+            let d1 = d0 + 86_400;
+            let mut items: Vec<Value> = Vec::new();
+            let mut day_total = 0i64;
+            for (a, b) in &segs {
+                let x = (*a).max(d0);
+                let y = (*b).min(d1);
+                if y > x {
+                    items.push(json!([x, y]));
+                    day_total += y - x;
+                }
+            }
+            total += day_total;
+            days_out.push(json!({
+                "date": (start_date + CDur::days(i)).format("%Y-%m-%d").to_string(),
+                "segments": items,
+                "total_s": day_total,
+            }));
+        }
+
+        json!({
+            "start": start_date.format("%Y-%m-%d").to_string(),
+            "end": (start_date + CDur::days(days - 1)).format("%Y-%m-%d").to_string(),
+            "today": today.format("%Y-%m-%d").to_string(),
+            "range": {"from": from_h, "to": to_h},
+            "days": days_out,
+            "total_s": total,
+        })
+    }
+
     pub fn usage_json(&self, days: i64) -> Value {
         let g = self.inner.lock().unwrap();
         json!({ "days": g.sessions.usage(&self.cfg, days) })
     }
 
-    pub fn history_json(&self, hours: i64) -> Value {
+    pub fn history_json(&self, hours: i64, max_points: usize) -> Value {
         let now = Local::now();
         let from = now - CDur::hours(hours);
         let g = self.inner.lock().unwrap();
 
-        let points: Vec<Point> = if hours <= 24 {
-            g.history
-                .ring()
-                .iter()
-                .filter(|p| p.at >= from)
-                .cloned()
-                .collect()
+        let ring: Vec<Point> = g
+            .history
+            .ring()
+            .iter()
+            .filter(|p| p.at >= from)
+            .cloned()
+            .collect();
+        // 内存环形缓冲覆盖不足时回退磁盘（例如预热失败或刚清过数据）
+        let points: Vec<Point> = if hours <= 24 && ring.len() > 1 {
+            ring
         } else {
             drop(g);
             History::load_range(&self.cfg, from, now)
         };
 
+        let points = History::downsample(points, max_points);
         let levels: Vec<u8> = points.iter().filter_map(|p| p.level).collect();
         json!({
             "from": util::rfc3339(from),
@@ -453,6 +525,7 @@ impl App {
             "count": points.len(),
             "points": points.iter().map(|p| json!({
                 "t": util::unix(p.at),
+                "at": util::rfc3339(p.at),
                 "level": p.level,
                 "wired": if p.wired { 1 } else { 0 },
                 "link": if p.online { "online" } else { "offline" },

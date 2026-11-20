@@ -194,6 +194,132 @@ impl SessionStore {
         out
     }
 
+    /// 从近 `days` 天的使用分布里推断"活跃小时带"：返回 `(from, to)`。
+    ///
+    /// 口径是**业务日**：每天从 04:00 到次日 03:59，凌晨 0–4 点算前一天的尾巴。
+    /// 因此返回值是"相对 04:00 的小时偏移"（0–24），而不是自然小时。
+    pub fn active_range(&self, cfg: &Config, days: i64) -> (u8, u8) {
+        let now = Local::now();
+        let days = days.max(1) as usize;
+        let first_day = now.date_naive() - ChronoDuration::days(days as i64 - 1);
+        let Some(start) = first_day
+            .and_hms_opt(4, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).single())
+        else {
+            return (0, 24);
+        };
+        let start_ts = start.timestamp();
+
+        // 每个业务日 × 每个小时，是否有过在线
+        let mut hit = vec![[false; 24]; days];
+        for (a, b) in self.intervals_between(cfg, start_ts, now.timestamp(), now) {
+            let mut t = a;
+            while t < b {
+                let off = t - start_ts;
+                let d = (off / 86_400) as usize;
+                let h = ((off % 86_400) / 3_600) as usize;
+                if d < days {
+                    hit[d][h] = true;
+                }
+                t = start_ts + (off / 3_600 + 1) * 3_600;
+            }
+        }
+
+        let mut counts = [0usize; 24];
+        for day in &hit {
+            for (h, on) in day.iter().enumerate() {
+                if *on {
+                    counts[h] += 1;
+                }
+            }
+        }
+
+        // 阈值基数用"实际有记录的天数"：刚装几天时 30 天的 10% 永远达不到，
+        // 会导致自适应永远退回 0–24
+        let active_days = hit.iter().filter(|d| d.iter().any(|x| *x)).count().max(1);
+        let threshold = (((active_days as f64) * 0.1).ceil() as usize)
+            .max(1)
+            .min(active_days);
+        let mut first: Option<usize> = None;
+        let mut last = 0usize;
+        for (h, count) in counts.iter().enumerate() {
+            if *count >= threshold {
+                if first.is_none() {
+                    first = Some(h);
+                }
+                last = h;
+            }
+        }
+
+        let Some(f) = first else { return (0, 24) };
+
+        // 两端各留余量；若活跃只到 24:00 之前，就不必把次日凌晨也画进来
+        let mut from = f.saturating_sub(1);
+        let mut to = if last <= 20 {
+            (last + 2).min(20)
+        } else {
+            (last + 2).min(24)
+        };
+        while to - from < 8 {
+            if to < 24 {
+                to += 1;
+            } else if from > 0 {
+                from -= 1;
+            } else {
+                break;
+            }
+        }
+        (from as u8, to as u8)
+    }
+
+    /// 取 `[from, to)` 内所有会话区间，并裁剪到该窗口（跨天会话会被截断）。
+    pub fn intervals_between(
+        &self,
+        cfg: &Config,
+        from: i64,
+        to: i64,
+        now: DateTime<Local>,
+    ) -> Vec<(i64, i64)> {
+        let mut out: Vec<(i64, i64)> = util::read_rows(&cfg.sessions_path())
+            .into_iter()
+            .filter(|r| r.len() >= 7 && r[0] != "session_id")
+            .filter_map(|r| {
+                let s = r[2].parse::<i64>().ok()?;
+                let e = r[4].parse::<i64>().ok()?;
+                if e <= from || s >= to {
+                    None
+                } else {
+                    Some((s.max(from), e.min(to)))
+                }
+            })
+            .collect();
+
+        if let Some(s) = &self.open {
+            let a = s.wake_at.timestamp();
+            let b = now.timestamp();
+            if b > from && a < to {
+                out.push((a.max(from), b.min(to)));
+            }
+        }
+
+        out.sort();
+
+        // 合并休眠造成的小间隙：鼠标静止就休眠，1 分钟档位下三五分钟的停顿
+        // 往往只是看文档/思考，不该切成两次使用
+        let merge_gap = (cfg.sleep_s as i64 * 3).max(300);
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (a, b) in out {
+            if let Some(last) = merged.last_mut() {
+                if a - last.1 <= merge_gap {
+                    last.1 = last.1.max(b);
+                    continue;
+                }
+            }
+            merged.push((a, b));
+        }
+        merged
+    }
+
     /// 最近 `days` 天，每小时在线多少分钟（0–60）。用于"课程表"热力图。
     ///
     /// 按会话区间与小时窗口求交集，而不是数采样点——采样点受节拍与休眠影响，
@@ -202,18 +328,13 @@ impl SessionStore {
         let now = Local::now();
         let today = now.date_naive();
 
-        let mut spans: Vec<(i64, i64)> = util::read_rows(&cfg.sessions_path())
-            .into_iter()
-            .filter(|r| r.len() >= 7 && r[0] != "session_id")
-            .filter_map(|r| {
-                let s = r[2].parse::<i64>().ok()?;
-                let e = r[4].parse::<i64>().ok()?;
-                Some((s, e))
-            })
-            .collect();
-        if let Some(s) = &self.open {
-            spans.push((s.wake_at.timestamp(), now.timestamp()));
-        }
+        // 走合并后的区间：休眠造成的小间隙不该被算成两次使用
+        let win_start = (today - ChronoDuration::days(days.max(1) - 1))
+            .and_hms_opt(0, 0, 0)
+            .and_then(|d| d.and_local_timezone(Local).single())
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        let spans = self.intervals_between(cfg, win_start, now.timestamp(), now);
 
         let mut out = Vec::new();
         for offset in (0..days.max(1)).rev() {

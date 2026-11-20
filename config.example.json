@@ -11,11 +11,15 @@
   "cycle_end_level": 10,
   "cycle_dead_hours": 24,
   "vid": "373B",
-  "pids": ["11D9", "11E7"],
+  "pids": [
+    "11D9",
+    "11E7"
+  ],
   "usage_page": "FF02",
   "read_timeout_ms": 250,
   "read_deadline_ms": 800,
   "retries": 3,
   "data_dir": "data",
-  "tray": true
+  "tray": true,
+  "sleep_s": 60
 }

@@ -99,6 +99,41 @@ impl History {
         Ok(())
     }
 
+    /// 桶降采样：把 `points` 压缩到 ≤`max` 个点。
+    ///
+    /// 30 天 × 60s 节拍 ≈ 4.3 万点，直接返回给浏览器是 ~2MB JSON，
+    /// 画线也会卡。按桶取平均电量、多数派 wired/online。
+    pub fn downsample(points: Vec<Point>, max: usize) -> Vec<Point> {
+        let n = points.len();
+        if max == 0 || n <= max {
+            return points;
+        }
+        let bucket = n.div_ceil(max);
+        points
+            .chunks(bucket)
+            .map(|c| {
+                let levels: Vec<u32> = c.iter().filter_map(|p| p.level).map(|v| v as u32).collect();
+                let wired = c.iter().filter(|p| p.wired).count() * 2 >= c.len();
+                let online = c.iter().filter(|p| p.online).count() * 2 >= c.len();
+                // 以离线为主的桶不给电量值：否则零星读数会被连成一条"其实一直在用"的假曲线
+                let level = if online && !levels.is_empty() {
+                    Some((levels.iter().sum::<u32>() / levels.len() as u32) as u8)
+                } else {
+                    None
+                };
+                let read_ms =
+                    c.iter().map(|p| p.read_ms).sum::<u32>() / c.len().max(1) as u32;
+                Point {
+                    at: c.last().expect("桶非空").at,
+                    level,
+                    wired,
+                    online,
+                    read_ms,
+                }
+            })
+            .collect()
+    }
+
     /// 最近 24h 的内存数据。
     pub fn ring(&self) -> &VecDeque<Point> {
         &self.ring
