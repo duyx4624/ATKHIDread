@@ -2,7 +2,6 @@
   "bind": "127.0.0.1",
   "port": 8731,
   "tick_s": 60,
-  "cache_ttl_s": 60,
   "offline_after_fails": 2,
   "history_interval_s": 300,
   "cycle_full_level": 100,

@@ -378,7 +378,8 @@ fieldset:first-of-type{border-top:0}
 legend{font-size:12px;color:var(--sub);padding:0 6px 0 0;letter-spacing:.02em}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px 18px}
 label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--sub)}
-label input[type=text],label input[type=number]{font:inherit;color:var(--text);padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff}
+label input[type=text],label input[type=number],label select{font:inherit;color:var(--text);padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff;width:100%}
+label select{appearance:none;-webkit-appearance:none;padding-right:30px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b98a5' fill='none' stroke-width='1.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
 label input:focus{outline:2px solid #cfe2f7;border-color:var(--accent)}
 label .hint{font-size:11px;color:#8b98a5}
 label.check{flex-direction:row;align-items:center;gap:8px;color:var(--text);margin-top:22px}
@@ -469,8 +470,6 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
   <fieldset><legend>采集</legend><div class="grid">
     <label>采样节拍（秒）<input type="number" data-key="tick_s" min="5" max="3600">
       <span class="hint">越小越灵敏，但 HID 读取更频繁</span></label>
-    <label>缓存有效期（秒）<input type="number" data-key="cache_ttl_s" min="1" max="3600">
-      <span class="hint">超过该时长标记为 stale</span></label>
     <label>鼠标休眠档位
       <select data-key="sleep_s">
         <option value="30">30 秒</option>
@@ -482,9 +481,9 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
         <option value="1500">25 分钟</option>
         <option value="1800">30 分钟</option>
       </select>
-      <span class="hint">与驱动里设置一致；判离线会自动放宽到"档位 + 2 个节拍"</span></label>
+      <span class="hint">与驱动里设置一致；判离线时长由它决定，改节拍不会缩短</span></label>
     <label>判离线失败次数（下限）<input type="number" data-key="offline_after_fails" min="1" max="10">
-      <span class="hint">仅作兜底，实际取它与休眠档位推导值的较大者</span></label>
+      <span class="hint" id="offline-hint">仅作兜底，实际取它与休眠档位推导值的较大者</span></label>
   </div></fieldset>
 
   <fieldset><legend>记录</legend><div class="grid">
@@ -499,8 +498,8 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
     <label>最短充电时长（分钟）<input type="number" data-key="cycle_min_charge_min" min="0" max="600">
       <span class="hint">防电压虚高把短充当满充</span></label>
     <label>周期结束电量（%）<input type="number" data-key="cycle_end_level" min="0" max="99"></label>
-    <label>失联判死时长（小时）<input type="number" data-key="cycle_dead_hours" min="1" max="720">
-      <span class="hint">超时未达阈值则记 unknown_end</span></label>
+    <label>周期超时（小时）<input type="number" data-key="cycle_dead_hours" min="1" max="720">
+      <span class="hint">放电周期内超过这么久没有数据就作废（记 unknown_end），避免把跨天的间隔算成一个周期</span></label>
   </div></fieldset>
 
   <fieldset><legend>服务</legend><div class="grid">
@@ -541,7 +540,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 <div id="modal"><div class="modal-box"><h3><span id="modal-title"></span><button id="modal-close" title="关闭">×</button></h3><div id="modal-body"></div></div></div>
 <div id="toast"></div>
 <script>
-const numKeys=new Set(['port','sleep_s','tick_s','cache_ttl_s','offline_after_fails','history_interval_s','data_max_mb','cycle_full_level','cycle_min_charge_min','cycle_end_level','cycle_dead_hours','read_timeout_ms','read_deadline_ms','retries']);
+const numKeys=new Set(['port','sleep_s','tick_s','offline_after_fails','history_interval_s','data_max_mb','cycle_full_level','cycle_min_charge_min','cycle_end_level','cycle_dead_hours','read_timeout_ms','read_deadline_ms','retries']);
 const fields=[...document.querySelectorAll('[data-key]')];
 const $=id=>document.getElementById(id);
 function toast(text,err){const t=$('toast');t.textContent=text;t.className='show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',4000);}
@@ -556,7 +555,22 @@ async function loadConfig(){
   }
   const eff=$('dd-effective');
   if(eff&&c.data_dir_effective) eff.textContent='当前实际：'+c.data_dir_effective;
+  refreshOfflineHint();
 }
+function refreshOfflineHint(){
+  const q=k=>document.querySelector('[data-key="'+k+'"]');
+  const tick=Number(q('tick_s')&&q('tick_s').value)||60;
+  const sleep=Number(q('sleep_s')&&q('sleep_s').value)||60;
+  const fails=Number(q('offline_after_fails')&&q('offline_after_fails').value)||2;
+  const probe=Math.min(Math.max(Math.floor(sleep/3),10),Math.max(tick,5));
+  const secs=Math.max(probe*2,30);
+  const el=$('offline-hint');
+  if(el)el.textContent='最后一次读取后再等 '+secs+'s（快探 '+probe+'s）判离线；休眠 '+sleep+'s 已含在内';
+}
+['input','change'].forEach(ev=>document.addEventListener(ev,e=>{
+  const k=e.target&&e.target.dataset&&e.target.dataset.key;
+  if(k==='tick_s'||k==='sleep_s'||k==='offline_after_fails')refreshOfflineHint();
+}));
 async function loadStatus(){
   try{
     const r=await fetch('/battery',{cache:'no-store'});
@@ -779,9 +793,7 @@ function mountCurveHover(cv){
     octx.beginPath();octx.moveTo(px,10);octx.lineTo(px,h-24);octx.stroke();octx.setLineDash([]);
     octx.beginPath();octx.arc(px,py,4,0,Math.PI*2);octx.fillStyle='#111827';octx.fill();
     tip.innerHTML=best.at.replace('T',' ').slice(5,16)+' · <b>'+best.level+'%</b> '+(best.wired?'有线':'无线');
-    tip.style.left=(cv.offsetLeft+px)+'px';
-    tip.style.top=(cv.offsetTop+py-8)+'px';
-    tip.style.display='block';
+    placeTip(tip,host,cv.offsetLeft+px,cv.offsetTop+py-8);
   };
   cv.onmouseleave=()=>{
     octx.clearRect(0,0,w,h);
@@ -796,6 +808,16 @@ function rrect(ctx,x,y,w,h,r){
 }
 function fmtDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function shiftDate(s,n){const d=s?new Date(s+'T00:00:00'):new Date();d.setDate(d.getDate()+n);return fmtDate(d);}
+function placeTip(tip,host,x,y){
+  tip.style.display='block';
+  const tw=tip.offsetWidth,th=tip.offsetHeight;
+  const hw=host.clientWidth||600;
+  // 以鼠标为中心，但不能让左/右半边出界
+  const left=Math.max(tw/2+4,Math.min(hw-tw/2-4,x));
+  const top=Math.max(th*1.15+2,y);   // 浮层以底边定位，别让它顶出画布
+  tip.style.left=left+'px';
+  tip.style.top=top+'px';
+}
 function hourOff(ts){const d=new Date(ts*1000);return ((d.getHours()+20)%24)+d.getMinutes()/60+d.getSeconds()/3600;}
 function hourLabel(off){return String((4+off)%24).padStart(2,'0')+':00';}
 function hhmm(t){const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');}
@@ -872,7 +894,7 @@ function drawWeek(cv,week,height,opts){
 
   // 当前时间线
   if(todayIdx>=0){
-    const now=new Date(), nh=now.getHours()+now.getMinutes()/60;
+    const nh=hourOff(Date.now()/1000);   // 必须用业务日偏移，不能用自然小时
     if(nh>=from&&nh<=to){
       const yy=padT+(nh-from)/span*plotH;
       ctx.strokeStyle='#e5533d';ctx.lineWidth=1.5;
@@ -952,7 +974,7 @@ function drawWeekWide(host,week){
   });
 
   if(todayIdx>=0){
-    const now=new Date(),nh=now.getHours()+now.getMinutes()/60;
+    const nh=hourOff(Date.now()/1000);
     if(nh>=from&&nh<=to){
       const yy=padT+(nh-from)/span*plotH;
       ctx.strokeStyle='#e5533d';ctx.lineWidth=1.5;
@@ -979,9 +1001,7 @@ function mountWeekWideHover(host,cv){
     const b=(cv._wkBlocks||[]).find(b=>mx>=b.x&&mx<=b.x+b.w&&my>=b.y-2&&my<=b.y+b.h+2);
     if(!b){tip.style.display='none';return;}
     tip.innerHTML=b.day.slice(5)+' '+hhmm(b.s)+'–'+hhmm(b.e)+' · <b>'+fmtDur(b.e-b.s)+'</b>';
-    tip.style.left=(r.left-hr.left+mx)+'px';
-    tip.style.top=(r.top-hr.top+my-10)+'px';
-    tip.style.display='block';
+    placeTip(tip,host,r.left-hr.left+mx,r.top-hr.top+my-10);
   };
   cv.onmouseleave=()=>{tip.style.display='none';};
 
@@ -1011,9 +1031,7 @@ function mountWeekHover(cv){
     const b=(cv._wkBlocks||[]).find(b=>mx>=b.x-3&&mx<=b.x+b.w+3&&my>=b.y-2&&my<=b.y+b.h+2);
     if(!b){tip.style.display='none';return;}
     tip.innerHTML=b.day.slice(5)+' '+hhmm(b.s)+'–'+hhmm(b.e)+' · <b>'+fmtDur(b.e-b.s)+'</b>';
-    tip.style.left=(cv.offsetLeft+b.x+b.w/2)+'px';
-    tip.style.top=(cv.offsetTop+b.y-6)+'px';
-    tip.style.display='block';
+    placeTip(tip,host,cv.offsetLeft+b.x+b.w/2,cv.offsetTop+b.y-6);
   };
   cv.onmouseleave=()=>{tip.style.display='none';};
 }

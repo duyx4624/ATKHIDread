@@ -14,7 +14,6 @@ pub struct Config {
     pub bind: String,
     pub port: u16,
     pub tick_s: u64,
-    pub cache_ttl_s: u64,
     pub offline_after_fails: u32,
     /// 鼠标驱动里的休眠档位（秒）。判离线时会放宽到该时长 + 2 个节拍。
     pub sleep_s: u64,
@@ -43,7 +42,6 @@ impl Default for Config {
             bind: "127.0.0.1".into(),
             port: 8731,
             tick_s: 60,
-            cache_ttl_s: 60,
             offline_after_fails: 2,
             sleep_s: 60,
             history_interval_s: 300,
@@ -98,9 +96,6 @@ impl Config {
         }
         if let Some(n) = v.get("tick_s").and_then(Value::as_u64) {
             self.tick_s = n.max(5);
-        }
-        if let Some(n) = v.get("cache_ttl_s").and_then(Value::as_u64) {
-            self.cache_ttl_s = n;
         }
         if let Some(n) = v.get("sleep_s").and_then(Value::as_u64) {
             self.sleep_s = n.clamp(5, 3600);
@@ -209,7 +204,6 @@ impl Config {
                 "--bind" => self.bind = take(val)?,
                 "--tick" => self.tick_s = take(val)?.parse::<u64>()?.max(5),
                 "--sleep" => self.sleep_s = take(val)?.parse::<u64>()?.clamp(5, 3600),
-                "--ttl" => self.cache_ttl_s = take(val)?.parse()?,
                 "--data-dir" => {
                     // 命令行显式指定的路径按当前工作目录解释（和大多数 CLI 一致）
                     let raw = take(val)?;
@@ -280,11 +274,6 @@ impl Config {
         if let Some(n) = num("sleep_s") {
             if !(5..=3600).contains(&n) {
                 anyhow::bail!("休眠档位应在 5–3600 秒之间");
-            }
-        }
-        if let Some(n) = num("cache_ttl_s") {
-            if !(1..=3600).contains(&n) {
-                anyhow::bail!("缓存有效期应在 1–3600 秒之间");
             }
         }
         if let Some(n) = num("offline_after_fails") {
@@ -400,7 +389,6 @@ impl Config {
             "port": self.port,
             "tick_s": self.tick_s,
             "sleep_s": self.sleep_s,
-            "cache_ttl_s": self.cache_ttl_s,
             "offline_after_fails": self.offline_after_fails,
             "history_interval_s": self.history_interval_s,
             "data_max_mb": self.data_max_mb,
@@ -431,9 +419,6 @@ impl Config {
     pub fn validate(&self, current_port: u16) -> Result<()> {
         if self.tick_s < 5 || self.tick_s > 3600 {
             anyhow::bail!("采样节拍应在 5–3600 秒之间");
-        }
-        if self.cache_ttl_s < 1 || self.cache_ttl_s > 3600 {
-            anyhow::bail!("缓存有效期应在 1–3600 秒之间");
         }
         if !(1..=10).contains(&self.offline_after_fails) {
             anyhow::bail!("判定离线所需失败次数应在 1–10 之间");

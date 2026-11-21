@@ -91,11 +91,12 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let server = http::bind(&app)?;
 
     let ticker = Arc::clone(&app);
-    let tick_s = cfg.tick_s.max(5);
+    // 节拍是动态的：读取失败后进入"快速探测"，确认离线或恢复后回到常规节拍
     std::thread::Builder::new()
         .name("hidread-tick".into())
         .spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(tick_s));
+            let wait = ticker.next_interval_s();
+            std::thread::sleep(Duration::from_secs(wait));
             ticker.tick();
         })?;
 

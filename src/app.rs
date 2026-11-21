@@ -168,6 +168,15 @@ impl App {
                 g.snapshot.error = None;
                 g.snapshot.present = true;
 
+                // 开始时间同样有盲区：离线状态下节拍是 tick_s，真实上线可能发生在
+                // 上一次采样之后、本次采样之前。从离线恢复时把开始时间前移半拍，
+                // 但不能早于上次判定离线的时刻，否则会话会重叠。
+                let half = chrono::Duration::milliseconds((self.cfg.tick_s.max(1) * 500) as i64);
+                let start_at = match (was_online, g.link.offline_since) {
+                    (false, Some(t)) => (now - half).max(t),
+                    _ => now, // 首次启动没有"上一次采样"可参考，不凭空补
+                };
+
                 g.link.online = true;
                 g.link.fails = 0;
                 g.link.last_seen = Some(now);
@@ -177,7 +186,7 @@ impl App {
                     self.event("online", &format!("{:04X}:{:04X}", iface.vid, iface.pid));
                 }
 
-                if let Err(e) = g.sessions.ensure_open(&self.cfg, now) {
+                if let Err(e) = g.sessions.ensure_open(&self.cfg, start_at) {
                     eprintln!("会话写入失败：{e:#}");
                 }
                 if let Err(e) = g.cycles.on_sample(&self.cfg, now, info.level, info.wired) {
@@ -210,19 +219,53 @@ impl App {
         }
     }
 
+    /// 快速探测节拍：休眠档位的 1/3，夹在 10 秒与常规节拍之间。
+    ///
+    /// 平时按 `tick_s` 慢采（省电、够用），一旦读不到数据就提速确认，
+    /// 这样"判定延迟"不会因为节拍大而虚长。
+    pub fn probe_s(&self) -> u64 {
+        // 注意 clamp 的上下界必须合法：tick 很小时 10 秒下限会大于上限而 panic
+        let cap = self.cfg.tick_s.max(5);
+        (self.cfg.sleep_s / 3).clamp(10.min(cap), cap)
+    }
+
+    /// 下一次采样前要等多久。
+    pub fn next_interval_s(&self) -> u64 {
+        let g = self.inner.lock().unwrap();
+        if g.link.online && g.link.fails > 0 {
+            self.probe_s()
+        } else {
+            self.cfg.tick_s.max(5)
+        }
+    }
+
     fn mark_failure(&self, now: DateTime<Local>) {
         let mut g = self.inner.lock().unwrap();
         g.link.fails += 1;
-        // 鼠标静态 1 分钟就会休眠，这属于正常使用而非离开：
-        // 判离线至少等到"休眠时长 + 2 个采样节拍"，否则每次休眠都会切断会话
-        let by_sleep = (self.cfg.sleep_s.div_ceil(self.cfg.tick_s.max(1)) + 2) as u32;
-        let threshold = self.cfg.offline_after_fails.max(by_sleep).max(1);
+        // 静默从"最后一次成功读取"起算——那时鼠标已经休眠（休眠期间一直在上报），
+        // 所以休眠档位已经隐含在 last_seen 里，这里只需追加确认时间，
+        // 再叠加 sleep_s 就等于把休眠算了两遍。
+        let probe = self.probe_s();
+        let limit = (probe * 2).max(30) as i64;
+        let silent = g
+            .link
+            .last_seen
+            .map(|t| (now - t).num_seconds())
+            .unwrap_or(0);
+        let threshold = self.cfg.offline_after_fails.max(2);
 
-        if g.link.online && g.link.fails >= threshold {
+        if g.link.online && silent >= limit && g.link.fails >= threshold {
             g.link.online = false;
             g.link.offline_since = Some(now);
-            let end = g.link.last_seen.unwrap_or(now);
-            self.event("offline", &format!("fails={}", g.link.fails));
+            // 盲区补偿：两次采样之间发生了什么无法知道，取半拍作为期望中点——
+            // 有时多记半拍、有时少记半拍，期望误差为零，而不是固定少记半拍
+            let half = chrono::Duration::milliseconds((self.cfg.tick_s.max(1) * 500) as i64);
+            let end = g
+                .link
+                .last_seen
+                .map(|t| (t + half).min(now))
+                .unwrap_or(now);
+            self.event("offline", &format!("fails={} silent={}s", g.link.fails, silent));
             if let Err(e) = g.sessions.close(&self.cfg, end, "no_reply") {
                 eprintln!("会话收尾失败：{e:#}");
             }
@@ -301,7 +344,9 @@ impl App {
             .map(|t| (now - t).num_milliseconds() as f64 / 1000.0)
             .unwrap_or(-1.0);
         let age_s: f64 = if age < 0.0 { 0.0 } else { age };
-        let stale = s.updated_at.is_none() || age_s > self.cfg.cache_ttl_s as f64;
+        // 陈旧判定跟着节拍走：允许漏一拍，两拍没更新就算陈旧
+        let ttl = (self.cfg.tick_s.max(5) * 2).max(10) as f64;
+        let stale = s.updated_at.is_none() || age_s > ttl;
         let ok = s.level.is_some();
 
         let status = if s.wired {
@@ -455,9 +500,13 @@ impl App {
             .and_then(|d| d.and_local_timezone(Local).single())
             .map(|d| d.timestamp())
             .unwrap_or(0);
+        // 画图用合并区间（视觉连续），统计用原始区间（不把休眠算进时长）
         let segs = g
             .sessions
-            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now);
+            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now, true);
+        let raw = g
+            .sessions
+            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now, false);
 
         let mut days_out = Vec::new();
         let mut total = 0i64;
@@ -465,12 +514,18 @@ impl App {
             let d0 = day0 + i * 86_400;
             let d1 = d0 + 86_400;
             let mut items: Vec<Value> = Vec::new();
-            let mut day_total = 0i64;
             for (a, b) in &segs {
                 let x = (*a).max(d0);
                 let y = (*b).min(d1);
                 if y > x {
                     items.push(json!([x, y]));
+                }
+            }
+            let mut day_total = 0i64;
+            for (a, b) in &raw {
+                let x = (*a).max(d0);
+                let y = (*b).min(d1);
+                if y > x {
                     day_total += y - x;
                 }
             }
@@ -509,13 +564,17 @@ impl App {
             .filter(|p| p.at >= from)
             .cloned()
             .collect();
-        // 内存环形缓冲覆盖不足时回退磁盘（例如预热失败或刚清过数据）
-        let points: Vec<Point> = if hours <= 24 && ring.len() > 1 {
-            ring
-        } else {
-            drop(g);
-            History::load_range(&self.cfg, from, now)
-        };
+        // 磁盘是按天的真源，内存环只补"尚未落盘的最新点"。
+        // 之前优先用环，预热不完整时曲线只剩几个点（整张图空白）。
+        drop(g);
+        let mut points = History::load_range(&self.cfg, from, now);
+        match points.last() {
+            Some(last) => {
+                let last_at = last.at;
+                points.extend(ring.into_iter().filter(|p| p.at > last_at));
+            }
+            None => points = ring,
+        }
 
         let points = History::downsample(points, max_points);
         let levels: Vec<u8> = points.iter().filter_map(|p| p.level).collect();

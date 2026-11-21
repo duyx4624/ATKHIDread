@@ -212,7 +212,7 @@ impl SessionStore {
 
         // 每个业务日 × 每个小时，是否有过在线
         let mut hit = vec![[false; 24]; days];
-        for (a, b) in self.intervals_between(cfg, start_ts, now.timestamp(), now) {
+        for (a, b) in self.intervals_between(cfg, start_ts, now.timestamp(), now, true) {
             let mut t = a;
             while t < b {
                 let off = t - start_ts;
@@ -279,6 +279,7 @@ impl SessionStore {
         from: i64,
         to: i64,
         now: DateTime<Local>,
+        merge: bool,
     ) -> Vec<(i64, i64)> {
         let mut out: Vec<(i64, i64)> = util::read_rows(&cfg.sessions_path())
             .into_iter()
@@ -303,9 +304,12 @@ impl SessionStore {
         }
 
         out.sort();
+        if !merge {
+            return out;
+        }
 
-        // 合并休眠造成的小间隙：鼠标静止就休眠，1 分钟档位下三五分钟的停顿
-        // 往往只是看文档/思考，不该切成两次使用
+        // 合并只用于"画图好看"；统计时长要用未合并的原始区间，
+        // 否则鼠标休眠的那几分钟会被算进使用时间
         let merge_gap = (cfg.sleep_s as i64 * 3).max(300);
         let mut merged: Vec<(i64, i64)> = Vec::new();
         for (a, b) in out {
@@ -334,7 +338,7 @@ impl SessionStore {
             .and_then(|d| d.and_local_timezone(Local).single())
             .map(|d| d.timestamp())
             .unwrap_or(0);
-        let spans = self.intervals_between(cfg, win_start, now.timestamp(), now);
+        let spans = self.intervals_between(cfg, win_start, now.timestamp(), now, true);
 
         let mut out = Vec::new();
         for offset in (0..days.max(1)).rev() {
