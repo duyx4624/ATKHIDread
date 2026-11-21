@@ -4,7 +4,7 @@
 //! 判离线需要连续 N 次失败，若用失败时刻收尾，每段会凭空多出 1–2 分钟。
 
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Local};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Timelike};
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -370,7 +370,7 @@ impl SessionStore {
         for offset in (0..days.max(1)).rev() {
             let day = today - ChronoDuration::days(offset);
             let Some(start) = day
-                .and_hms_opt(0, 0, 0)
+                .and_hms_opt(4, 0, 0)
                 .and_then(|d| d.and_local_timezone(Local).single())
             else {
                 continue;
@@ -416,7 +416,12 @@ impl SessionStore {
 
     /// `now` 显式传入，便于测试固定"今天"。`daily` 只是它的当前时间版本。
     fn daily_until(&self, cfg: &Config, days: i64, now: DateTime<Local>) -> Vec<Value> {
-        let today = now.date_naive();
+        // 业务日：04:00 到次日 03:59，与 /week 保持同一口径
+        let today = if now.hour() < 4 {
+            now.date_naive() - ChronoDuration::days(1)
+        } else {
+            now.date_naive()
+        };
         let mut out = Vec::new();
 
         // 只读一次 sessions.csv：之前是每天读一遍，90 天视图要读 90 次
@@ -433,7 +438,7 @@ impl SessionStore {
             let day = today - ChronoDuration::days(offset);
             let date = day.format("%Y-%m-%d").to_string();
             let Some(start) = day
-                .and_hms_opt(0, 0, 0)
+                .and_hms_opt(4, 0, 0)
                 .and_then(|d| d.and_local_timezone(Local).single())
             else {
                 continue;
@@ -448,7 +453,10 @@ impl SessionStore {
 
             let sessions: Vec<&Session> = all
                 .iter()
-                .filter(|s| s.wake_at.date_naive() == day)
+                .filter(|s| {
+                    let t = s.wake_at.timestamp();
+                    t >= d0 && t < d1
+                })
                 .collect();
             let longest = sessions
                 .iter()
@@ -556,8 +564,8 @@ mod tests {
         let store = SessionStore::load(&c);
         let days = store.daily_until(&c, 2, at(day + ChronoDuration::days(1), 12, 0));
         assert_eq!(days[0]["date"], "2026-11-20");
-        assert_eq!(days[0]["online_s"], 3600, "23:00→24:00 只算 1 小时");
-        assert_eq!(days[1]["online_s"], 7200, "00:00→02:00 算 2 小时");
+        assert_eq!(days[0]["online_s"], 10800, "业务日 04:00 起：23:00→次日02:00 全归 11-20");
+        assert_eq!(days[1]["online_s"], 0, "11-21 业务日从 04:00 才开始");
         assert_eq!(days[0]["sessions"], 1);
         assert_eq!(days[1]["sessions"], 0, "会话计数仍按开始日归属");
     }

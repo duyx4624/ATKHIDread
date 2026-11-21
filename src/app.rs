@@ -3,6 +3,7 @@
 //! HTTP 请求只读 `inner` 快照（微秒级），永远不碰 HID；
 //! 设备句柄被单独的锁保护，只有节拍线程持有。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -65,6 +66,26 @@ enum TickResult {
     NoDevice(String),
 }
 
+
+/// 采样间隔的相位抖动：±10%。
+///
+/// 如果节拍与休眠档位成整数比（如都是 60s），采样点会和休眠周期锁死在同一相位，
+/// 误差永远偏向一侧、无法均摊；抖动让相位缓慢漂移，长期期望回到中点。
+static TICK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn jitter(base: u64) -> u64 {
+    let span = (base / 10).max(1);
+    let seq = TICK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nano = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let rnd = (seq ^ nano).wrapping_mul(6364136223846793005) >> 33;
+    let low = base.saturating_sub(span).max(5);
+    let high = (base + span).max(low);
+    low + rnd % (high - low + 1)
+}
+
 pub struct App {
     pub cfg: Config,
     /// 配置文件里的值（不含 CLI/环境变量覆盖），设置页读写这一份
@@ -72,6 +93,8 @@ pub struct App {
     pub started: DateTime<Local>,
     inner: Mutex<Inner>,
     device: Mutex<Option<Opened>>,
+    /// 上一次实际等待的秒数（含抖动），用于盲区补偿的"半拍"
+    last_gap_s: AtomicU64,
 }
 
 impl App {
@@ -111,6 +134,7 @@ impl App {
             started,
             inner: Mutex::new(inner),
             device: Mutex::new(None),
+            last_gap_s: AtomicU64::new(0),
         }
     }
 
@@ -181,7 +205,7 @@ impl App {
                 // 开始时间同样有盲区：离线状态下节拍是 tick_s，真实上线可能发生在
                 // 上一次采样之后、本次采样之前。从离线恢复时把开始时间前移半拍，
                 // 但不能早于上次判定离线的时刻，否则会话会重叠。
-                let half = chrono::Duration::milliseconds((self.cfg.tick_s.max(1) * 500) as i64);
+                let half = self.half_gap();
                 let start_at = match (was_online, g.link.offline_since) {
                     (false, Some(t)) => (now - half).max(t),
                     _ => now, // 首次启动没有"上一次采样"可参考，不凭空补
@@ -253,12 +277,25 @@ impl App {
 
     /// 下一次采样前要等多久。
     pub fn next_interval_s(&self) -> u64 {
-        let g = self.inner.lock().unwrap();
-        if g.link.online && g.link.fails > 0 {
-            self.probe_s()
-        } else {
-            self.cfg.tick_s.max(5)
-        }
+        let base = {
+            let g = self.inner.lock().unwrap();
+            if g.link.online && g.link.fails > 0 {
+                self.probe_s()
+            } else {
+                self.cfg.tick_s.max(5)
+            }
+        };
+        let v = jitter(base);
+        self.last_gap_s.store(v, Ordering::Relaxed);
+        v
+    }
+
+    /// 盲区补偿的半拍：用"上一次实际等待时长"的一半，而不是配置里的标称节拍。
+    /// 抖动是对称的，所以期望仍是半个节拍，但用真实值可以把方差也收掉。
+    fn half_gap(&self) -> chrono::Duration {
+        let gap = self.last_gap_s.load(Ordering::Relaxed);
+        let gap = if gap == 0 { self.cfg.tick_s.max(5) } else { gap };
+        chrono::Duration::milliseconds((gap as i64) * 500)
     }
 
     fn mark_failure(&self, now: DateTime<Local>) {
@@ -282,7 +319,7 @@ impl App {
             g.link.offline_since = Some(now);
             // 盲区补偿：两次采样之间发生了什么无法知道，取半拍作为期望中点——
             // 有时多记半拍、有时少记半拍，期望误差为零，而不是固定少记半拍
-            let half = chrono::Duration::milliseconds((self.cfg.tick_s.max(1) * 500) as i64);
+            let half = self.half_gap();
             let end = g
                 .link
                 .last_seen
@@ -508,7 +545,12 @@ impl App {
     /// 周视图：7 天的会话区间 + 自学习出来的时间轴范围。
     pub fn week_json(&self, start: Option<&str>, days: i64) -> Value {
         let now = Local::now();
-        let today = now.date_naive();
+        // 与 daily 同步：业务日 04:00 起，凌晨未睡时"今天"仍是前一天
+        let today = if chrono::Timelike::hour(&now) < 4 {
+            now.date_naive() - CDur::days(1)
+        } else {
+            now.date_naive()
+        };
         let days = days.clamp(1, 60);
 
         let start_date = start
@@ -681,4 +723,29 @@ fn open_target(cfg: &Config) -> Result<Opened> {
     let iface = cands.remove(0);
     let dev = hid::Device::open(&iface)?;
     Ok(Opened { iface, dev })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jitter;
+
+    #[test]
+    fn jitter_stays_in_range() {
+        for base in [5u64, 10, 20, 60, 300] {
+            let span = (base / 10).max(1);
+            let low = base.saturating_sub(span).max(5);
+            let high = (base + span).max(low);
+            for _ in 0..200 {
+                let v = jitter(base);
+                assert!(v >= low, "base={base} v={v} low={low}");
+                assert!(v <= high, "base={base} v={v} high={high}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_actually_varies() {
+        let vals: std::collections::HashSet<u64> = (0..64).map(|_| jitter(60)).collect();
+        assert!(vals.len() > 1, "抖动没有产生变化");
+    }
 }

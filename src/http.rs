@@ -178,10 +178,14 @@ fn origin_ok(req: &Request) -> bool {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "[::1]" | "::1"
-    )
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // 127.0.0.0/8 与 ::1 都是回环，不能只认 127.0.0.1
+    h.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// 从 `scheme://host[:port]` 里取 host（IPv6 保留方括号）。
@@ -565,7 +569,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 <form id="f">
   <fieldset><legend>采集</legend><div class="grid">
     <label>采样节拍（秒）<input type="number" data-key="tick_s" min="5" max="3600">
-      <span class="hint">越小越灵敏，但 HID 读取更频繁</span></label>
+      <span class="hint">越小越灵敏；实际间隔带 ±10% 抖动，避免与休眠档位锁相</span></label>
     <label>鼠标休眠档位
       <select data-key="sleep_s">
         <option value="30">30 秒</option>
@@ -578,7 +582,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
         <option value="1800">30 分钟</option>
       </select>
       <span class="hint">与驱动里设置一致；判离线时长由它决定，改节拍不会缩短</span></label>
-    <label>判离线失败次数（下限）<input type="number" data-key="offline_after_fails" min="1" max="10">
+    <label>判离线失败次数（下限）<input type="number" data-key="offline_after_fails" min="2" max="10">
       <span class="hint" id="offline-hint">与静默阈值同时满足才判离线；调大只会更慢</span></label>
   </div></fieldset>
 
@@ -669,8 +673,11 @@ function refreshOfflineHint(){
   const quiet=Math.max(probe*2,30);
   // 从最后一次成功读取算起：首次失败最多要等一个节拍，之后每 probe 秒确认一次
   const est=Math.max(quiet,tick)+(fails-1)*probe;
+  const lo=Math.max(quiet,tick);
+  const hi=lo+(fails-1)*probe;
+  const range=hi>lo?(lo+'~'+hi+'s'):(lo+'s');
   const el=$('offline-hint');
-  if(el)el.textContent='最后一次读取后约 '+est+'s 判离线（静默 ≥'+quiet+'s 且失败 ≥'+fails+' 次；平时 '+tick+'s / 快探 '+probe+'s）';
+  if(el)el.textContent=range+' 判离线 · 快探 '+probe+'s · 休眠 '+sleep+'s 已含在末次读取里';
 }
 ['input','change'].forEach(ev=>document.addEventListener(ev,e=>{
   const k=e.target&&e.target.dataset&&e.target.dataset.key;

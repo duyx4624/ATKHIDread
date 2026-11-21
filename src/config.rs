@@ -117,7 +117,7 @@ impl Config {
             self.sleep_s = n.clamp(5, 3600);
         }
         if let Some(n) = v.get("offline_after_fails").and_then(Value::as_u64) {
-            self.offline_after_fails = n.max(1) as u32;
+            self.offline_after_fails = n.clamp(2, 10) as u32;
         }
         if let Some(n) = v.get("history_interval_s").and_then(Value::as_u64) {
             self.history_interval_s = n.max(10);
@@ -304,8 +304,8 @@ impl Config {
             }
         }
         if let Some(n) = num("offline_after_fails") {
-            if !(1..=10).contains(&n) {
-                anyhow::bail!("判定离线所需失败次数应在 1–10 之间");
+            if !(2..=10).contains(&n) {
+                anyhow::bail!("判定离线所需失败次数应在 2–10 之间");
             }
         }
         if let Some(n) = num("history_interval_s") {
@@ -459,8 +459,8 @@ impl Config {
         if self.tick_s < 5 || self.tick_s > 3600 {
             anyhow::bail!("采样节拍应在 5–3600 秒之间");
         }
-        if !(1..=10).contains(&self.offline_after_fails) {
-            anyhow::bail!("判定离线所需失败次数应在 1–10 之间");
+        if !(2..=10).contains(&self.offline_after_fails) {
+            anyhow::bail!("判定离线所需失败次数应在 2–10 之间");
         }
         if self.history_interval_s < 10 || self.history_interval_s > 86_400 {
             anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
