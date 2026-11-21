@@ -1,6 +1,6 @@
 [package]
 name = "hidread"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "ATK X1 Ultimate 2.0 电量读取与本地 HTTP 桥接服务"
 license = "MIT"
@@ -17,6 +17,8 @@ tray-icon = "0.24.2"
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Devices_DeviceAndDriverInstallation",

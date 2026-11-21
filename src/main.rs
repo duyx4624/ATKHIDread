@@ -10,6 +10,7 @@ mod hid;
 mod history;
 mod http;
 mod session;
+mod notice;
 mod tray;
 mod util;
 
@@ -70,7 +71,10 @@ fn run() -> Result<()> {
 }
 
 fn cmd_serve(args: &[String]) -> Result<()> {
-    let cfg = Config::load(args)?;
+    // 自启注册的命令带 --autostart：开机启动时不打扰，只在手动双击时提示
+    let notify = !args.iter().any(|a| a == "--autostart");
+    let filtered: Vec<String> = args.iter().filter(|a| *a != "--autostart").cloned().collect();
+    let cfg = Config::load(&filtered)?;
 
     // 无控制台（双击启动）→ 日志写文件，避免日志凭空消失
     if !has_console() {
@@ -125,7 +129,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     let url = format!("http://{}:{}", cfg.bind, cfg.port);
     if cfg.tray {
-        if let Err(e) = tray::run(url) {
+        if let Err(e) = tray::run(url, notify) {
             eprintln!("托盘不可用（{e:#}），转为纯后台运行");
             park();
         }

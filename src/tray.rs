@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, MSG, SW_SHOWNORMAL,
 };
 
-pub fn run(url: String) -> Result<()> {
+pub fn run(url: String, notify: bool) -> Result<()> {
     let menu = Menu::new();
     let open = MenuItem::new("打开设置页", true, None);
     let sep = PredefinedMenuItem::separator();
@@ -31,6 +31,14 @@ pub fn run(url: String) -> Result<()> {
         .with_icon(battery_icon()?)
         .build()
         .context("创建托盘图标失败（explorer 未运行？）")?;
+
+    // 只有手动双击启动才提示；开机自启靠 --autostart 跳过
+    if notify {
+        let _ = crate::notice::balloon(
+            "hidread 已启动",
+            &format!("设置页 {url}\n右键托盘图标可打开、重启或退出"),
+        );
+    }
 
     // 菜单事件单独一个线程，避免阻塞消息循环
     let url_cl = url.clone();

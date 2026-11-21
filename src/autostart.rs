@@ -26,7 +26,7 @@ pub fn install(data_dir: &Path) -> Result<String> {
     let data = strip_extended(data);
 
     let cmd = format!(
-        "\"{}\" serve --data-dir \"{}\"",
+        "\"{}\" serve --data-dir \"{}\" --autostart",
         exe.display(),
         data.display()
     );
