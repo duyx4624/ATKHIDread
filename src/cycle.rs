@@ -17,8 +17,11 @@ struct Current {
     start_level: u8,
     quality: String,
     offline_s: i64,
+    /// 拔线前这次充电持续了多少分钟（在 open 时定格，之后 charge_started 会被清掉）
+    charge_min: i64,
 }
 
+#[derive(Clone)]
 pub struct CycleStore {
     current: Option<Current>,
     charge_started: Option<DateTime<Local>>,
@@ -40,7 +43,8 @@ impl CycleStore {
             last_wired: None,
             last_online: None,
             offline_since: None,
-            next_id: 1,
+            // 状态文件可能丢（手工删除/异常退出），用 CSV 里的最大 id 兜底，避免重号
+            next_id: Self::next_id_from_csv(cfg),
         };
 
         if let Ok(text) = std::fs::read_to_string(cfg.cycle_state_path()) {
@@ -49,8 +53,9 @@ impl CycleStore {
                     if let Some(at) =
                         DateTime::from_timestamp(start_unix, 0).map(|t| t.with_timezone(&Local))
                     {
+                        let id = v.get("id").and_then(Value::as_u64).unwrap_or(1);
                         store.current = Some(Current {
-                            id: v.get("id").and_then(Value::as_u64).unwrap_or(1),
+                            id,
                             start_at: at,
                             start_level: v
                                 .get("start_level")
@@ -62,14 +67,61 @@ impl CycleStore {
                                 .unwrap_or("charged")
                                 .to_string(),
                             offline_s: v.get("offline_s").and_then(Value::as_i64).unwrap_or(0),
+                            charge_min: v.get("charge_min").and_then(Value::as_i64).unwrap_or(0),
                         });
-                        store.next_id = v.get("id").and_then(Value::as_u64).unwrap_or(1) + 1;
+                        store.next_id = store.next_id.max(id + 1);
                     }
                 }
+                // 这些字段决定"充电中重启后还能不能判出满充"，以及失联多久收尾
+                store.last_online = ts_field(&v, "last_seen_unix");
+                store.charge_started = ts_field(&v, "charge_started_unix");
+                store.saw_full = v.get("saw_full").and_then(Value::as_bool).unwrap_or(false);
+                store.full_confirmed = v
+                    .get("full_confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
             }
         }
 
         store
+    }
+
+    fn next_id_from_csv(cfg: &Config) -> u64 {
+        util::read_rows(&cfg.cycles_path())
+            .iter()
+            .filter(|r| !r.is_empty() && r[0] != "cycle_id")
+            .filter_map(|r| r[0].parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// 落盘完整状态（周期 + 充电确认进度）。
+    ///
+    /// 只写周期字段是不够的：充电中重启会丢掉 `charge_started/saw_full`，
+    /// 拔线时就把满充误判成 partial；`last_seen` 丢了则 `on_offline` 永不收尾。
+    fn persist(&self, cfg: &Config) -> Result<()> {
+        if self.current.is_none() && self.charge_started.is_none() {
+            let _ = std::fs::remove_file(cfg.cycle_state_path());
+            return Ok(());
+        }
+
+        let mut v = json!({
+            "last_seen_unix": self.last_online.map(util::unix),
+            "charge_started_unix": self.charge_started.map(util::unix),
+            "saw_full": self.saw_full,
+            "full_confirmed": self.full_confirmed,
+        });
+        if let Some(c) = &self.current {
+            v["id"] = json!(c.id);
+            v["start_at"] = json!(util::rfc3339(c.start_at));
+            v["start_unix"] = json!(util::unix(c.start_at));
+            v["start_level"] = json!(c.start_level);
+            v["quality"] = json!(c.quality);
+            v["offline_s"] = json!(c.offline_s);
+            v["charge_min"] = json!(c.charge_min);
+        }
+        util::write_json_atomic(&cfg.cycle_state_path(), &v)
     }
 
     pub fn current_json(&self, now: DateTime<Local>, last_level: Option<u8>) -> Value {
@@ -106,15 +158,19 @@ impl CycleStore {
         }
 
         let prev = self.last_wired.replace(wired);
+        let mut dirty = false;
         match (prev, wired) {
             (Some(false), true) => {
                 // 插线：开始充电计时；未跑完的周期记 interrupted
                 self.charge_started = Some(at);
                 self.saw_full = false;
                 self.full_confirmed = false;
-                if self.current.is_some() {
+                let had_cycle = self.current.is_some();
+                if had_cycle {
                     self.close(cfg, at, level, "interrupted", "plugged_in")?;
                 }
+                // close 内部已经落盘；没有周期可关时才需要自己写
+                dirty = !had_cycle;
             }
             (Some(true), false) => {
                 // 拔线：判定是否算「充满」
@@ -129,10 +185,16 @@ impl CycleStore {
                 self.charge_started = None;
                 self.saw_full = false;
                 self.full_confirmed = false;
+                // open 已写过一次；清掉充电态后还要再写一次
+                dirty = true;
             }
             (None, true) => {
-                // 服务启动时已经在充电：从现在开始计充电时长
-                self.charge_started = Some(at);
+                // 服务启动时已经在充电：从恢复的 charge_started 继续计时，
+                // 没有记录才从现在开始（否则重启会把已充时长清零）
+                if self.charge_started.is_none() {
+                    self.charge_started = Some(at);
+                    dirty = true;
+                }
             }
             (None, false) if self.current.is_none() && level >= cfg.cycle_full_level => {
                 // 服务晚于拔线启动：只能记估计起点
@@ -142,10 +204,16 @@ impl CycleStore {
         }
 
         if wired && level >= cfg.cycle_full_level {
-            self.saw_full = true;
+            if !self.saw_full {
+                self.saw_full = true;
+                dirty = true;
+            }
             if let Some(started) = self.charge_started {
-                if (at - started).num_minutes() >= cfg.cycle_min_charge_min as i64 {
+                if (at - started).num_minutes() >= cfg.cycle_min_charge_min as i64
+                    && !self.full_confirmed
+                {
                     self.full_confirmed = true;
+                    dirty = true;
                 }
             }
         }
@@ -154,6 +222,9 @@ impl CycleStore {
             self.close(cfg, at, level, "", "")?;
         }
 
+        if dirty {
+            self.persist(cfg)?;
+        }
         Ok(())
     }
 
@@ -190,22 +261,16 @@ impl CycleStore {
             start_level: level,
             quality: quality.to_string(),
             offline_s: 0,
+            // 必须在清掉 charge_started 之前定格
+            charge_min: self
+                .charge_started
+                .map(|s| (at - s).num_minutes().max(0))
+                .unwrap_or(0),
         };
         self.next_id += 1;
         let _ = note;
-        util::write_json_atomic(
-            &cfg.cycle_state_path(),
-            &json!({
-                "id": c.id,
-                "start_at": util::rfc3339(c.start_at),
-                "start_unix": util::unix(c.start_at),
-                "start_level": c.start_level,
-                "quality": c.quality,
-                "offline_s": c.offline_s,
-            }),
-        )?;
         self.current = Some(c);
-        Ok(())
+        self.persist(cfg)
     }
 
     fn close(
@@ -226,10 +291,7 @@ impl CycleStore {
         } else {
             quality.to_string()
         };
-        let charge_min = self
-            .charge_started
-            .map(|s| (end - s).num_minutes().max(0))
-            .unwrap_or(0);
+        let charge_min = c.charge_min;
 
         let line = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{}",
@@ -247,8 +309,8 @@ impl CycleStore {
             note
         );
         util::append_line(&cfg.cycles_path(), &line)?;
-        let _ = std::fs::remove_file(cfg.cycle_state_path());
-        Ok(())
+        // 不能直接删状态文件：充电中/刚插线时还有 charge_started 要留着
+        self.persist(cfg)
     }
 
     /// 历史周期（按结束时间倒序）。
@@ -306,10 +368,17 @@ impl CycleStore {
     }
 }
 
+fn ts_field(v: &Value, key: &str) -> Option<DateTime<Local>> {
+    v.get(key)
+        .and_then(Value::as_i64)
+        .and_then(|s| DateTime::from_timestamp(s, 0))
+        .map(|t| t.with_timezone(&Local))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration as ChronoDuration, TimeZone};
 
     fn cfg(name: &str) -> Config {
         let mut c = Config::default();
@@ -403,5 +472,49 @@ mod tests {
         let st = CycleStore::stats(&c);
         assert_eq!(st["count"], 2, "partial 不应参与统计");
         assert_eq!(st["avg_duration_text"], util::dur_text(90_000));
+    }
+
+    #[test]
+    fn charge_state_survives_restart() {
+        let c = cfg("restart-charge");
+        let mut s = CycleStore::load(&c);
+        s.on_sample(&c, t(9, 0), 15, false).unwrap();
+        s.on_sample(&c, t(10, 0), 15, true).unwrap(); // 插线
+        s.on_sample(&c, t(10, 30), 100, true).unwrap(); // 充够 30 分钟
+
+        // 重启：只靠状态文件重建
+        let mut s2 = CycleStore::load(&c);
+        s2.on_sample(&c, t(10, 45), 100, true).unwrap(); // 仍在充电
+        s2.on_sample(&c, t(11, 0), 95, false).unwrap(); // 拔线
+
+        let cur = s2.current_json(t(11, 1), Some(95));
+        assert_eq!(cur["quality"], "charged", "充电中重启后拔线仍应判满充");
+        assert_eq!(cur["start_level"], 95);
+
+        s2.on_sample(&c, t(20, 0), 9, false).unwrap(); // 掉到阈值收尾
+        let rows = util::read_rows(&c.cycles_path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][9], "60", "充电时长应从重启前的 10:00 起算");
+    }
+
+    #[test]
+    fn restart_then_device_gone_closes_cycle() {
+        let c = cfg("restart-zombie");
+        let mut s = CycleStore::load(&c);
+        s.on_sample(&c, t(9, 0), 100, true).unwrap();
+        s.on_sample(&c, t(10, 0), 95, false).unwrap(); // 开周期
+        assert!(!s.current_json(t(10, 1), Some(95)).is_null());
+
+        // 重启后设备再也不回来：失联超过 cycle_dead_hours 必须收尾，不能变僵尸
+        let mut s2 = CycleStore::load(&c);
+        s2.on_offline(&c, t(10, 0) + ChronoDuration::hours(25))
+            .unwrap();
+        assert!(
+            s2.current_json(t(11, 0), Some(95)).is_null(),
+            "超过周期超时应收尾为 unknown_end"
+        );
+        let rows = util::read_rows(&c.cycles_path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][10], "unknown_end");
     }
 }

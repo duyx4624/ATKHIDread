@@ -84,6 +84,17 @@ impl Config {
         cfg.data_dir = resolve_data_dir(&cfg.data_dir);
         // 统一成绝对路径：自启注册、日志位置都依赖它
         cfg.data_dir = std::path::absolute(&cfg.data_dir).unwrap_or(cfg.data_dir);
+
+        // 日志文件同样按 exe 目录解析相对路径，保持"绿色版数据都在软件目录里"
+        if let Some(log) = cfg.log_file.take() {
+            cfg.log_file = Some(if log.is_relative() {
+                config_path()
+                    .and_then(|p| p.parent().map(|d| d.join(&log)))
+                    .unwrap_or(log)
+            } else {
+                log
+            });
+        }
         Ok(cfg)
     }
 
@@ -92,7 +103,12 @@ impl Config {
             self.bind = s.to_string();
         }
         if let Some(n) = v.get("port").and_then(Value::as_u64) {
-            self.port = n as u16;
+            // 不用 `as u16`：70000 会被截成 4464、65536 会截成 0（随机端口）
+            if let Ok(p) = u16::try_from(n) {
+                if p > 0 {
+                    self.port = p;
+                }
+            }
         }
         if let Some(n) = v.get("tick_s").and_then(Value::as_u64) {
             self.tick_s = n.max(5);
@@ -127,14 +143,20 @@ impl Config {
             }
         }
         if let Some(arr) = v.get("pids").and_then(Value::as_array) {
-            let list: Vec<u16> = arr
-                .iter()
-                .filter_map(|x| match x {
-                    Value::String(s) => parse_hex_u16(s),
-                    Value::Number(n) => n.as_u64().map(|v| v as u16),
-                    _ => None,
-                })
-                .collect();
+            let mut list: Vec<u16> = Vec::new();
+            for x in arr {
+                match x {
+                    Value::String(s) => match parse_hex_u16(s) {
+                        Some(v) => list.push(v),
+                        None => eprintln!("警告：pids 里的 `{s}` 不是合法十六进制 PID，已忽略"),
+                    },
+                    Value::Number(n) => match n.as_u64().and_then(|v| u16::try_from(v).ok()) {
+                        Some(v) => list.push(v),
+                        None => eprintln!("警告：pids 里的 `{n}` 超出 16 位范围，已忽略"),
+                    },
+                    _ => eprintln!("警告：pids 里的 `{x}` 不是字符串或数字，已忽略"),
+                }
+            }
             if !list.is_empty() {
                 self.pids = list;
             }
@@ -215,10 +237,15 @@ impl Config {
                 }
                 "--pids" => {
                     let raw = take(val)?;
-                    let list: Vec<u16> = raw
-                        .split(',')
-                        .filter_map(|s| parse_hex_u16(s.trim()))
-                        .collect();
+                    let mut list: Vec<u16> = Vec::new();
+                    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let Some(pid) = parse_hex_u16(item) else {
+                            anyhow::bail!(
+                                "--pids 里的 `{item}` 不是合法十六进制 PID（例如 11D9,11E7）"
+                            );
+                        };
+                        list.push(pid);
+                    }
                     if list.is_empty() {
                         anyhow::bail!("--pids 需要至少一个 PID，例如 11D9,11E7");
                     }
@@ -357,6 +384,16 @@ impl Config {
         Ok(())
     }
 
+    /// 拼接监听地址：IPv6 要加方括号，否则 `::1:8731` 解析不出来。
+    pub fn socket_addr(&self) -> String {
+        let host = self.bind.trim_matches(|c| c == '[' || c == ']');
+        if host.contains(':') {
+            format!("[{host}]:{}", self.port)
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+
     /// 历史 CSV 的路径。
     pub fn history_path(&self, date: &str) -> PathBuf {
         self.data_dir.join(format!("history-{date}.csv"))
@@ -403,6 +440,8 @@ impl Config {
             "read_deadline_ms": self.read_deadline_ms,
             "retries": self.retries,
             "data_dir": self.data_dir.display().to_string(),
+            // 必须回写：否则从设置页保存一次，手写的 log_file 就被静默删掉
+            "log_file": self.log_file.as_ref().map(|p| p.display().to_string()),
             "tray": self.tray,
         })
     }
@@ -427,7 +466,7 @@ impl Config {
             anyhow::bail!("历史基线间隔应在 10–86400 秒之间");
         }
         if !(16..=10240).contains(&self.data_max_mb) {
-            anyhow::bail!("历史保留天数应在 1–365 之间");
+            anyhow::bail!("数据上限应在 16–10240 MB 之间");
         }
         if self.cycle_full_level == 0 || self.cycle_full_level > 100 {
             anyhow::bail!("满充判定电量应在 1–100 之间");
@@ -441,7 +480,7 @@ impl Config {
         if !(1..=720).contains(&self.cycle_dead_hours) {
             anyhow::bail!("失联判定时长应在 1–720 小时之间");
         }
-        if self.bind.parse::<std::net::IpAddr>().is_err() {
+        if self.bind.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().is_err() {
             anyhow::bail!("监听地址不是合法的 IP（例如 127.0.0.1）");
         }
         if self.port == 0 {
@@ -449,7 +488,7 @@ impl Config {
         }
         if self.port != current_port {
             // 只有端口真的变了才试绑，避免把当前监听中的端口当成占用
-            if let Ok(addr) = format!("{}:{}", self.bind, self.port).parse::<std::net::SocketAddr>() {
+            if let Ok(addr) = self.socket_addr().parse::<std::net::SocketAddr>() {
                 if std::net::TcpListener::bind(addr).is_err() {
                     anyhow::bail!("端口 {} 已被占用", self.port);
                 }
@@ -559,3 +598,37 @@ hidread —— ATK 2.4G 鼠标电量桥接服务
   --vid <HEX>       USB VID（默认 373B）
   --pids <HEX,HEX>  两种模式的 PID（默认 11D9,11E7）
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_addr_wraps_ipv6() {
+        let mut c = Config::default();
+        c.port = 8731;
+        assert_eq!(c.socket_addr(), "127.0.0.1:8731");
+        c.bind = "::1".into();
+        assert_eq!(c.socket_addr(), "[::1]:8731");
+        c.bind = "[::1]".into();
+        assert_eq!(c.socket_addr(), "[::1]:8731");
+    }
+
+    #[test]
+    fn to_json_keeps_log_file() {
+        let mut c = Config::default();
+        assert!(c.to_json()["log_file"].is_null(), "未设置时应写 null");
+
+        c.log_file = Some(PathBuf::from("logs/hidread.log"));
+        assert_eq!(c.to_json()["log_file"], "logs/hidread.log");
+    }
+
+    #[test]
+    fn port_out_of_range_does_not_truncate() {
+        let mut c = Config::default();
+        c.apply_json(&serde_json::json!({"port": 65536}));
+        assert_eq!(c.port, 8731, "越界端口应忽略，而不是截成 0");
+        c.apply_json(&serde_json::json!({"port": 9000}));
+        assert_eq!(c.port, 9000);
+    }
+}

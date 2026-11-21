@@ -22,7 +22,7 @@ use crate::util;
 type Body = Response<Cursor<Vec<u8>>>;
 
 pub fn bind(app: &App) -> Result<Server> {
-    let addr = format!("{}:{}", app.cfg.bind, app.cfg.port);
+    let addr = app.cfg.socket_addr();
     let server = Server::http(&addr).map_err(|e| anyhow!("监听 {addr} 失败：{e}"))?;
 
     eprintln!(
@@ -36,98 +36,129 @@ pub fn bind(app: &App) -> Result<Server> {
     Ok(server)
 }
 
+/// 并发处理请求：单个慢请求（30 天曲线要读几十个 CSV）不该把 `/battery` 一起堵住。
+const WORKERS: usize = 4;
+
 pub fn run(server: Server, app: Arc<App>) -> Result<()> {
-    for mut request in server.incoming_requests() {
-        let path = request.url().to_string();
-        let (route, q) = split_query(&path);
-        let method = request.method().clone();
-
-        let response = if method == Method::Post && route == "/api/config" {
-            if !origin_ok(&request) {
-                json_resp(403, &json!({"ok": false, "error": "拒绝跨站请求"}))
-            } else {
-                let mut body = String::new();
-                let _ = request
-                    .as_reader()
-                    .take(64 * 1024)
-                    .read_to_string(&mut body);
-                save_config(&app, &body)
-            }
-        } else if method != Method::Get {
-            json_resp(405, &json!({"error": "只支持 GET"}))
-        } else {
-            match route {
-                "/" => html_resp(SETTINGS_HTML.replace("{{VER}}", env!("CARGO_PKG_VERSION"))),
-                "/battery" => {
-                    let (code, v) = app.battery_json();
-                    json_resp(code, &v)
-                }
-                "/health" => json_resp(200, &app.health_json()),
-                "/raw" => json_resp(200, &app.raw_json()),
-                "/session" => json_resp(200, &app.session_json()),
-                "/sessions" => {
-                    let day = q
-                        .get("day")
-                        .cloned()
-                        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
-                    json_resp(200, &app.sessions_json(&day))
-                }
-                "/daily" => {
-                    let days = int_param(&q, "days", 14, 1, 90);
-                    json_resp(200, &app.daily_json(days))
-                }
-                "/history" => {
-                    let hours = int_param(&q, "hours", 24, 1, 24 * 30);
-                    let max = int_param(&q, "max", 1200, 100, 5000) as usize;
-                    json_resp(200, &app.history_json(hours, max))
-                }
-                "/history.csv" => {
-                    let days = int_param(&q, "days", 7, 1, 30);
-                    csv_resp(history_csv(&app.cfg, days), "hidread-history.csv")
-                }
-                "/daily.csv" => {
-                    let days = int_param(&q, "days", 14, 1, 90);
-                    csv_resp(daily_csv(&app, days), "hidread-daily.csv")
-                }
-                "/events" => {
-                    let days = int_param(&q, "days", 7, 1, 30);
-                    json_resp(200, &events_json(&app.cfg, days))
-                }
-                "/cycles" => {
-                    let limit = int_param(&q, "limit", 10, 1, 100) as usize;
-                    json_resp(200, &app.cycles_json(limit))
-                }
-                "/api/config" => json_resp(200, &config_json(&app)),
-                "/usage" => {
-                    let days = int_param(&q, "days", 14, 1, 90);
-                    json_resp(200, &app.usage_json(days))
-                }
-                "/week" => {
-                    let start = q.get("start").map(String::as_str);
-                    let days = int_param(&q, "days", 7, 1, 60);
-                    json_resp(200, &app.week_json(start, days))
-                }
-                "/chart" => {
-                    let hours = int_param(&q, "hours", 24, 1, 24 * 30);
-                    html_resp(chart_html(hours))
-                }
-                _ => json_resp(
-                    404,
-                    &json!({"error": "未知路径", "paths": [
-                        "/", "/battery", "/health", "/raw", "/session", "/sessions", "/daily",
-                        "/history", "/history.csv", "/daily.csv", "/events", "/cycles",
-                        "/api/config", "/chart"
-                    ]}),
-                ),
-            }
-        };
-
-        if let Err(e) = request.respond(response) {
-            eprintln!("响应失败：{e}");
-        }
+    let server = Arc::new(server);
+    let mut workers = Vec::with_capacity(WORKERS);
+    for i in 0..WORKERS {
+        let server = Arc::clone(&server);
+        let app = Arc::clone(&app);
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("hidread-http-{i}"))
+                .spawn(move || loop {
+                    match server.recv() {
+                        Ok(request) => handle(request, &app),
+                        Err(_) => break, // 服务端关闭
+                    }
+                })?,
+        );
     }
-
+    for w in workers {
+        let _ = w.join();
+    }
     Ok(())
+}
+
+fn handle(mut request: Request, app: &App) {
+    let path = request.url().to_string();
+    let (route, q) = split_query(&path);
+    let method = request.method().clone();
+
+    let response = if method == Method::Post && route == "/api/config" {
+        if !remote_is_local(&request) {
+            json_resp(403, &json!({"ok": false, "error": "只允许本机修改配置"}))
+        } else if !origin_ok(&request) {
+            json_resp(403, &json!({"ok": false, "error": "拒绝跨站请求"}))
+        } else if !is_json_content_type(&request) {
+            // 必须是 application/json：跨站表单发不出这个类型，
+            // 也就无法用 simple request 绕过浏览器预检
+            json_resp(
+                415,
+                &json!({"ok": false, "error": "Content-Type 必须是 application/json"}),
+            )
+        } else {
+            let mut body = String::new();
+            let _ = request
+                .as_reader()
+                .take(64 * 1024)
+                .read_to_string(&mut body);
+            save_config(app, &body)
+        }
+    } else if method != Method::Get {
+        json_resp(405, &json!({"error": "只支持 GET"}))
+    } else {
+        match route {
+            "/" => html_resp(SETTINGS_HTML.replace("{{VER}}", env!("CARGO_PKG_VERSION"))),
+            "/battery" => {
+                let (code, v) = app.battery_json();
+                json_resp(code, &v)
+            }
+            "/health" => json_resp(200, &app.health_json()),
+            "/raw" => json_resp(200, &app.raw_json()),
+            "/session" => json_resp(200, &app.session_json()),
+            "/sessions" => {
+                let day = q
+                    .get("day")
+                    .cloned()
+                    .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+                json_resp(200, &app.sessions_json(&day))
+            }
+            "/daily" => {
+                let days = int_param(&q, "days", 14, 1, 90);
+                json_resp(200, &app.daily_json(days))
+            }
+            "/history" => {
+                let hours = int_param(&q, "hours", 24, 1, 24 * 30);
+                let max = int_param(&q, "max", 1200, 100, 5000) as usize;
+                json_resp(200, &app.history_json(hours, max))
+            }
+            "/history.csv" => {
+                let days = int_param(&q, "days", 7, 1, 30);
+                csv_resp(history_csv(&app.cfg, days), "hidread-history.csv")
+            }
+            "/daily.csv" => {
+                let days = int_param(&q, "days", 14, 1, 90);
+                csv_resp(daily_csv(app, days), "hidread-daily.csv")
+            }
+            "/events" => {
+                let days = int_param(&q, "days", 7, 1, 30);
+                json_resp(200, &events_json(&app.cfg, days))
+            }
+            "/cycles" => {
+                let limit = int_param(&q, "limit", 10, 1, 100) as usize;
+                json_resp(200, &app.cycles_json(limit))
+            }
+            "/api/config" => json_resp(200, &config_json(app)),
+            "/usage" => {
+                let days = int_param(&q, "days", 14, 1, 90);
+                json_resp(200, &app.usage_json(days))
+            }
+            "/week" => {
+                let start = q.get("start").map(String::as_str);
+                let days = int_param(&q, "days", 7, 1, 60);
+                json_resp(200, &app.week_json(start, days))
+            }
+            "/chart" => {
+                let hours = int_param(&q, "hours", 24, 1, 24 * 30);
+                html_resp(chart_html(hours))
+            }
+            _ => json_resp(
+                404,
+                &json!({"error": "未知路径", "paths": [
+                    "/", "/battery", "/health", "/raw", "/session", "/sessions", "/daily",
+                    "/history", "/history.csv", "/daily.csv", "/events", "/cycles",
+                    "/usage", "/week", "/api/config", "/chart"
+                ]}),
+            ),
+        }
+    };
+
+    if let Err(e) = request.respond(response) {
+        eprintln!("响应失败：{e}");
+    }
 }
 
 /// 只接受同源（或没有 Origin 的本地客户端）的写请求，挡住浏览器跨站表单。
@@ -139,8 +170,71 @@ fn origin_ok(req: &Request) -> bool {
     else {
         return true;
     };
-    let v = h.value.as_str();
-    v.contains("127.0.0.1") || v.contains("localhost")
+    // 不能用 contains：`127.0.0.1.nip.io` / `localhost.evil.com` 都含关键字
+    match origin_host(h.value.as_str()) {
+        Some(host) => is_loopback_host(host),
+        None => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]" | "::1"
+    )
+}
+
+/// 从 `scheme://host[:port]` 里取 host（IPv6 保留方括号）。
+fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin.split_once("://")?.1;
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    if let Some(after) = authority.strip_prefix('[') {
+        let end = after.find(']')? + 1;
+        return authority.get(..=end);
+    }
+    Some(match authority.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => authority,
+    })
+}
+
+fn is_json_content_type(req: &Request) -> bool {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("content-type"))
+        .map(|h| {
+            h.value
+                .as_str()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+        .unwrap_or(false)
+}
+
+fn remote_is_local(req: &Request) -> bool {
+    req.remote_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+/// 设置页里的 `data_dir` 可能是相对路径；注册自启必须写绝对路径，
+/// 否则登录时 CWD 不同会把数据写进 System32。
+fn effective_data_dir(raw: &std::path::Path) -> std::path::PathBuf {
+    if raw.is_absolute() {
+        return raw.to_path_buf();
+    }
+    crate::config::config_path()
+        .and_then(|p| p.parent().map(|d| d.join(raw)))
+        .unwrap_or_else(|| raw.to_path_buf())
 }
 
 fn config_json(app: &App) -> Value {
@@ -176,7 +270,9 @@ fn save_config(app: &App, body: &str) -> Body {
     if let Some(want) = want_auto {
         if want != has_auto {
             let res = if want {
-                autostart::install(&app.cfg.data_dir).map(|_| ())
+                // 用这次保存后的数据目录：同一次保存里改了 data_dir 又开了自启时，
+                // 注册表不能还指向旧路径
+                autostart::install(&effective_data_dir(&next.data_dir)).map(|_| ())
             } else {
                 autostart::uninstall().map(|_| ())
             };
@@ -483,7 +579,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
       </select>
       <span class="hint">与驱动里设置一致；判离线时长由它决定，改节拍不会缩短</span></label>
     <label>判离线失败次数（下限）<input type="number" data-key="offline_after_fails" min="1" max="10">
-      <span class="hint" id="offline-hint">仅作兜底，实际取它与休眠档位推导值的较大者</span></label>
+      <span class="hint" id="offline-hint">与静默阈值同时满足才判离线；调大只会更慢</span></label>
   </div></fieldset>
 
   <fieldset><legend>记录</legend><div class="grid">
@@ -551,6 +647,13 @@ async function loadConfig(){
     const k=el.dataset.key;
     if(el.type==='checkbox') el.checked=!!c[k];
     else if(k==='pids') el.value=(c[k]||[]).join(',');
+    else if(el.tagName==='SELECT'){
+      // 配置文件里可能是下拉框没有预设的值（如 45s），补一个选项再选中，
+      // 否则浏览器会落到第一项，保存时被静默改成 30s
+      const v=String(c[k]??'');
+      if(v&&![...el.options].some(o=>o.value===v)) el.add(new Option(v+'（当前值）',v));
+      el.value=v;
+    }
     else el.value=c[k]??'';
   }
   const eff=$('dd-effective');
@@ -561,11 +664,13 @@ function refreshOfflineHint(){
   const q=k=>document.querySelector('[data-key="'+k+'"]');
   const tick=Number(q('tick_s')&&q('tick_s').value)||60;
   const sleep=Number(q('sleep_s')&&q('sleep_s').value)||60;
-  const fails=Number(q('offline_after_fails')&&q('offline_after_fails').value)||2;
+  const fails=Math.max(1,Number(q('offline_after_fails')&&q('offline_after_fails').value)||2);
   const probe=Math.min(Math.max(Math.floor(sleep/3),10),Math.max(tick,5));
-  const secs=Math.max(probe*2,30);
+  const quiet=Math.max(probe*2,30);
+  // 从最后一次成功读取算起：首次失败最多要等一个节拍，之后每 probe 秒确认一次
+  const est=Math.max(quiet,tick)+(fails-1)*probe;
   const el=$('offline-hint');
-  if(el)el.textContent='最后一次读取后再等 '+secs+'s（快探 '+probe+'s）判离线；休眠 '+sleep+'s 已含在内';
+  if(el)el.textContent='最后一次读取后约 '+est+'s 判离线（静默 ≥'+quiet+'s 且失败 ≥'+fails+' 次；平时 '+tick+'s / 快探 '+probe+'s）';
 }
 ['input','change'].forEach(ev=>document.addEventListener(ev,e=>{
   const k=e.target&&e.target.dataset&&e.target.dataset.key;
@@ -1207,4 +1312,35 @@ fetch('/history?hours={hours}').then(r=>r.json()).then(draw).catch(e=>{{
 }});
 </script></html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_host_parses_scheme_and_port() {
+        assert_eq!(origin_host("http://127.0.0.1:8731"), Some("127.0.0.1"));
+        assert_eq!(origin_host("http://localhost"), Some("localhost"));
+        assert_eq!(origin_host("https://[::1]:8731"), Some("[::1]"));
+        assert_eq!(origin_host("null"), None);
+    }
+
+    #[test]
+    fn origin_host_keeps_attacker_suffix() {
+        // 这俩就是旧 contains 校验的绕过样本：host 不等于回环地址
+        assert!(!is_loopback_host(
+            origin_host("http://127.0.0.1.nip.io").unwrap()
+        ));
+        assert!(!is_loopback_host(
+            origin_host("http://localhost.evil.com").unwrap()
+        ));
+    }
+
+    #[test]
+    fn loopback_hosts_are_accepted() {
+        for h in ["127.0.0.1", "localhost", "LOCALHOST", "[::1]", "::1"] {
+            assert!(is_loopback_host(h), "{h} 应视为回环");
+        }
+    }
 }

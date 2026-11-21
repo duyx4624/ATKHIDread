@@ -27,8 +27,8 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
-    AttachConsole, GetConsoleWindow, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
-    STD_OUTPUT_HANDLE,
+    AttachConsole, GetConsoleWindow, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS,
+    STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 
@@ -74,7 +74,11 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     // 无控制台（双击启动）→ 日志写文件，避免日志凭空消失
     if !has_console() {
-        redirect_output(&cfg.data_dir.join("hidread.log"));
+        let log = cfg
+            .log_file
+            .clone()
+            .unwrap_or_else(|| cfg.data_dir.join("hidread.log"));
+        redirect_output(&log);
     }
 
     if !acquire_single_instance(restart_wait_ms())? {
@@ -94,10 +98,20 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     // 节拍是动态的：读取失败后进入"快速探测"，确认离线或恢复后回到常规节拍
     std::thread::Builder::new()
         .name("hidread-tick".into())
-        .spawn(move || loop {
-            let wait = ticker.next_interval_s();
-            std::thread::sleep(Duration::from_secs(wait));
-            ticker.tick();
+        .spawn(move || {
+            // 数据上限是长期运行的约束：每天跨日时清一次，而不是只在启动时清
+            let mut purge_day = Local::now().date_naive();
+            loop {
+                let wait = ticker.next_interval_s();
+                std::thread::sleep(Duration::from_secs(wait));
+                ticker.tick();
+
+                let today = Local::now().date_naive();
+                if today != purge_day {
+                    purge_day = today;
+                    history::History::purge(&ticker.cfg);
+                }
+            }
         })?;
 
     let http_app = Arc::clone(&app);
@@ -132,12 +146,19 @@ fn cmd_once(args: &[String]) -> Result<()> {
     let cfg = Config::load(args)?;
     let (iface, mut dev) = open_target(&cfg)?;
     let started = std::time::Instant::now();
-    let raw = dev.exchange(
+    let reply = dev.exchange(
         cfg.retries,
         Duration::from_millis(cfg.read_timeout_ms),
         Duration::from_millis(cfg.read_deadline_ms),
     )?;
     let ms = started.elapsed().as_millis();
+    let raw = match reply {
+        hid::Exchange::Valid(raw) => raw,
+        hid::Exchange::Invalid(raw) => bail!("帧校验失败：{}", atk::hex(&raw)),
+        hid::Exchange::NoReply => {
+            bail!("设备没有给出有效回复（鼠标可能已休眠，动一下鼠标再试）")
+        }
+    };
     let info = atk::parse(&raw).with_context(|| format!("帧校验失败：{}", atk::hex(&raw)))?;
 
     println!(
@@ -188,7 +209,7 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                     Duration::from_millis(cfg.read_timeout_ms),
                     Duration::from_millis(cfg.read_deadline_ms),
                 ) {
-                    Ok(raw) => {
+                    Ok(hid::Exchange::Valid(raw)) | Ok(hid::Exchange::Invalid(raw)) => {
                         let parsed = atk::parse(&raw);
                         println!(
                             "    raw = {}\n    → {:?}{}",
@@ -196,6 +217,9 @@ fn cmd_probe(args: &[String]) -> Result<()> {
                             parsed,
                             if parsed.is_none() { "（校验未通过）" } else { "" }
                         );
+                    }
+                    Ok(hid::Exchange::NoReply) => {
+                        println!("    没有回复（鼠标可能已休眠，动一下鼠标再试）")
                     }
                     Err(e) => println!("    读取失败：{e:#}"),
                 }
@@ -420,8 +444,22 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// 从终端启动时把父控制台挂回来（双击启动时这里会失败，属预期）。
+///
+/// 只在标准句柄**无效**时才回挂：`hidread history > out.csv` 这类重定向
+/// 已经给了有效句柄，无条件 SetStdHandle(CONOUT$) 会让输出写进控制台、
+/// 文件恒为空（管道同理）。
 fn setup_console() {
     unsafe {
+        let out_ok = GetStdHandle(STD_OUTPUT_HANDLE)
+            .map(|h| !h.is_invalid())
+            .unwrap_or(false);
+        let err_ok = GetStdHandle(STD_ERROR_HANDLE)
+            .map(|h| !h.is_invalid())
+            .unwrap_or(false);
+        if out_ok && err_ok {
+            return;
+        }
+
         if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
             let name = wide("CONOUT$");
             if let Ok(h) = CreateFileW(
@@ -435,8 +473,12 @@ fn setup_console() {
                 FILE_FLAGS_AND_ATTRIBUTES(0),
                 None,
             ) {
-                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+                if !out_ok {
+                    let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                }
+                if !err_ok {
+                    let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+                }
             }
         }
     }

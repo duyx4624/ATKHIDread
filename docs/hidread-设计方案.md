@@ -2,10 +2,10 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v1.3 |
-| 日期 | 2026-11-18 |
-| 状态 | 已定案（形态 B+），待实现 |
-| 变更 | v1.3 插线实测回填（双 PID + `wired` 确认）、新增会话与每日表（§3.8、§4.10–4.11）；v1.2 放电周期；v1.1 历史与在线状态；v1.0 初版 |
+| 文档版本 | v1.4 |
+| 日期 | 2026-11-21 |
+| 状态 | 已实现，维护中 |
+| 变更 | v1.4 审查修复同步：CLI 重定向、`log_file` 生效、周期状态完整持久化、每日时长按天裁剪、`wired_s` 按采样间隔累计、写接口同源校验、HTTP 并发；v1.3 插线实测回填（双 PID + `wired` 确认）、新增会话与每日表（§3.8、§4.10–4.11）；v1.2 放电周期；v1.1 历史与在线状态；v1.0 初版 |
 | 目标产物 | 单文件 `hidread.exe` + 1 个 LiteMonitor 插件 JSON |
 | 参考实现 | `my_devices.py`（仓库根目录，189,819 字节 / 5010 行） |
 
@@ -243,8 +243,8 @@ GET /battery
 | 插/拔 USB 线（PID 切换） | 句柄报 `ERROR_DEVICE_NOT_CONNECTED`，或枚举结果由 `11D9` 变 `11E7` | 关句柄 → 重枚举 → 按 `UsagePage=0xFF02` 重开；记 `mode_change`；**不**重置 session 与 cycle |
 | 校验失败（乱码回复） | `valid()` 为假 | 记为 `error="bad frame: <hex>"`，不使用该值，重试 |
 | PC 睡眠后唤醒 | `now − last_tick > 3 × tick_s` | 记 `host_resume` 事件，**不**累计失败、**不**判离线（§3.5） |
-| 端口被占用 | `bind` 失败 | 打印明确错误并退出码 2，不静默换端口 |
-| 服务被开两份 | 命名互斥量 `Global\hidread-singleton` | 第二份拒绝启动（避免两个进程抢同一设备的输入队列） |
+| 端口被占用 | `bind` 失败 | 打印明确错误并退出码 1，不静默换端口 |
+| 服务被开两份 | 命名互斥量 `Local\hidread-singleton` | 第二份拒绝启动（避免两个进程抢同一设备的输入队列）。用 `Local\` 而不是 `Global\`：多用户会话各自可以有一份，互不干扰 |
 | 数值越界（如 `0xFF`） | 解析后 clamp 0..100 | 取 100 并写日志；`error` 仍为 null（`error` 只表示"没读到"） |
 
 ### 3.5 节拍、采样与落盘
@@ -306,9 +306,9 @@ if now - last_tick > 3 * tick_s:
 **其它落盘规则**
 
 - 写文件用「打开 → 追加一行 → 关闭」，不长期持有句柄，避免你随时想导出时被锁。
-- 保留期 `history_days`（默认 30），启动时清理过期文件；不删非本项目文件。
+- 保留期按**数据目录总量**控制（`data_max_mb`，默认 200 MB）：从最旧的 `history-*.csv` / `events-*.csv` 删起，最近 7 天始终保留；`sessions.csv` / `cycles.csv` 不参与。启动时清一次，之后**每次跨日再清一次**（长期运行也不会一直涨）。
 - `data/` 不可写（例如 exe 放在 `Program Files`）→ 自动回退到 `%LOCALAPPDATA%\hidread\data`，只告警一次，功能不中断。
-- 内存里维护最近 24 h 的环形缓冲（≈1440 点），`/history?hours=24` 直接内存应答；更长时间跨度才读磁盘。
+- 内存里维护最近 24 h 的环形缓冲（≈1440 点）：环的起点覆盖查询窗口时直接内存应答，零磁盘 I/O；预热失败或窗口超过环长才回退磁盘，并用环补"尚未落盘的最新点"。
 
 ### 3.6 在线状态与"开机时间"的语义边界
 
@@ -414,11 +414,11 @@ if now - last_tick > 3 * tick_s:
 
 **插拔线不算新会话**：`mode_change`（`11D9` ↔ `11E7`）不结束会话——你只是换了连接方式，人还在用。这条很重要，否则每次插线都会把使用时间切碎。重枚举一般只造成 1 次读取失败，而判离线门槛是 2 次，正好不会把换模式误判成休眠。
 
-**服务重启**：从 `sessions-state.json` 恢复。若停机 ≤ 3 个节拍（最小 180 s）且设备仍在线，延续同一会话；否则以 `service_stop` 收尾并开新会话。状态文件每个节拍刷新一次 `last_seen_unix`，这是重启后判断"这段空档该不该算在线"的唯一依据。
+**服务重启**：从 `session-state.json` 恢复。若停机 ≤ 3 个节拍（最小 180 s）且设备仍在线，延续同一会话；否则以 `service_stop` 收尾并开新会话。状态文件每个节拍刷新一次 `last_seen_unix`，这是重启后判断"这段空档该不该算在线"的唯一依据。恢复出来的会话不会再补一条 `online` 事件（那只是进程重启，不是状态跳变）。
 
 **落盘**
 
-`data/sessions.csv`：`session_id, start_at, start_unix, end_at, end_unix, duration_s, samples, end_reason`
+`data/sessions.csv`：`session_id, start_at, start_unix, end_at, end_unix, duration_s, end_reason`
 
 **每日聚合不落盘**：`/daily` 每次请求时从 `sessions.csv` + `history-*.csv` 现算。单一真相（raw 数据），避免 `daily.csv` 与源数据打架。数据量很小（一天几十条会话 + 几百个采样点），现算毫秒级。
 
@@ -426,15 +426,17 @@ if now - last_tick > 3 * tick_s:
 
 | 列 | 来源 | 说明 |
 |---|---|---|
-| 唤醒次数 | sessions | 当天 `start` 落在该日的会话数 |
-| 在线时长 | sessions | Σ `duration_s` |
+| 唤醒次数 | sessions | 当天 `start` 落在该日的会话数（跨午夜的会话只归前一天） |
+| 在线时长 | sessions | 把会话区间按天裁剪后求和，与 `/week` 同口径；跨午夜的会话第二天只算跨过来的那段 |
 | 离线时长 | 24h − 在线 | 含休眠与关机 |
 | 首次唤醒 / 末次休眠 | sessions | 时刻 |
-| 最长一段 | sessions | 最长的单次会话 |
+| 最长一段 | sessions | 最长的单次会话（按完整时长，不裁剪） |
 | 电量 首/末/最低/最高 | history | 当天非空采样 |
-| 有线时长 | history | `wired=1` 的采样数 × tick |
+| 有线时长 | history | 相邻采样点时间差累计（`wired` 且 `online` 的区间，单段上限 `history_interval_s`，末点补一个 `tick_s`） |
 
 > **口径提醒**：这里叫"在线时长"，不叫"使用时长"。鼠标只要没休眠就一直在响应，你人离开但鼠标还没睡的那段时间也会被计入。它是使用时间的**上界**，误差来自休眠超时本身（厂商固件决定，不可见）。这一点会写在 `/daily` 的响应字段名和 HTML 表头里，不玩文字游戏。
+
+> **为什么 `wired_s` 不用"行数 × tick"**：历史行只在电量变化或基线间隔（默认 300 s）才写，稳定插线时一行代表 300 s 却只按 60 s 记，会系统性低估约 5 倍。按相邻点时间差累计才对得上真实时长。
 
 ---
 
@@ -494,7 +496,7 @@ if now - last_tick > 3 * tick_s:
 | 字段 | 类型 | 语义 |
 |---|---|---|
 | `ok` | bool | 是否**曾经**成功读到过值（即使当前陈旧仍为 true） |
-| `stale` | bool | `age_s > cache_ttl_s`，表示这次拿到的是刷新前的值 |
+| `stale` | bool | `age_s > max(2 × tick_s, 10)`，表示这次拿到的是两拍之前的旧值 |
 | `age_s` | number | 距上次成功读取的秒数，1 位小数 |
 | `battery.level` | int \| null | 原始百分比，0–100 |
 | `battery.level_text` | string | 显示用字符串；无值时为 `"--"`（避免插件里出现 `"--%"`） |
@@ -521,11 +523,11 @@ if now - last_tick > 3 * tick_s:
 ### 4.3 `GET /health`
 
 ```json
-{ "ok": true, "version": "0.1.0", "uptime_s": 3120, "present": true,
-  "last_age_s": 42.1, "refreshing": false, "last_error": null }
+{ "ok": true, "version": "0.2.3", "uptime_s": 3120, "present": true,
+  "last_age_s": 42, "last_error": null }
 ```
 
-用途：确认服务活着、设备在不在。**不触发刷新**。
+用途：确认服务活着、设备在不在。**不触发刷新**。`last_age_s` 是整数秒。
 
 ### 4.4 `GET /raw`
 
@@ -543,10 +545,10 @@ if now - last_tick > 3 * tick_s:
 { "state": "online", "session_start_at": "2026-11-18T09:12:40+08:00",
   "session_uptime_s": 11245, "session_uptime_text": "3h07m",
   "offline_since": null, "consecutive_fails": 0,
-  "today": { "online_s": 21400, "offline_s": 3200, "transitions": 7 } }
+  "today": { "online_s": 21400, "online_text": "5h57m" } }
 ```
 
-`today` 由 `events-*.csv` 当日记录现算：在线总时长、离线总时长、切换次数。这是"今天它醒了多少次"的直接答案。
+`today.online_s` 是当天（自然日）里已结束会话的 `duration_s` 之和加上进行中的那段。它与 `/daily` 的按天裁剪口径不同：这里**不做裁剪**，只用于状态卡展示，不参与每日统计。
 
 ### 4.6 `GET /history?hours=24` — 曲线数据
 
@@ -646,7 +648,9 @@ if now - last_tick > 3 * tick_s:
 | 要点 | 说明 |
 |---|---|
 | 校验顺序 | 先 `check_raw` 校验原始值，再 `apply_json`。反过来会被 clamp 静默改写（`tick_s=1` 变 5、`port=70000` 截成 4464） |
-| 跨站防护 | 检查 `Origin`，只接受 `127.0.0.1` / `localhost`，否则 403 |
+| 跨站防护 | `Origin` 解析出 host 后**精确比对** `127.0.0.1` / `localhost` / `[::1]`，否则 403。不能用字符串 `contains`：`127.0.0.1.nip.io`、`localhost.evil.com` 都含关键字 |
+| 内容类型 | POST 必须 `Content-Type: application/json`，否则 415。跨站表单发不出这个类型，也就无法用 simple request 绕过浏览器预检 |
+| 写权限 | 只接受来自回环地址的请求。把 `bind` 改成 `0.0.0.0` 后局域网可以读状态，但改配置会得到 403 |
 | 自动重启 | 释放单实例互斥量 → 拉起新进程（带 `HIDREAD_RESTART`，最多等 4 s 拿锁）→ 旧进程退出 |
 | 失败行为 | 400 返回具体原因，**不写文件、不重启** |
 | 生效方式 | 统一"保存即重启"，不做运行时热改，避免半生效的中间态 |
@@ -671,25 +675,25 @@ if now - last_tick > 3 * tick_s:
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `bind` | `127.0.0.1` | 改成 `0.0.0.0` 才对外可见，默认不做 |
+| `bind` | `127.0.0.1` | 改成 `0.0.0.0` 才对外可见；对外时写接口仍然只允许回环来源（§4.12） |
 | `port` | `8731` | |
-| `cache_ttl_s` | `60` | 本次定案值 |
 | `vid` | `0x373B` | |
 | `pids` | `[0x11D9, 0x11E7]` | 无线 / 有线两种模式；两者同时存在时优先取有线（`11E7`） |
 | `usage_page` | `0xFF02` | 换鼠标时的第一调整项 |
 | `read_timeout_ms` | `250` | 单次读超时 |
 | `read_deadline_ms` | `800` | 单轮总预算 |
 | `retries` | `3` | |
-| `tick_s` | `60` | 节拍周期；采集、状态判定、缓存刷新共用 |
-| `offline_after_fails` | `2` | 连续失败几次判定离线（≈120 s 确认） |
+| `tick_s` | `60` | 节拍周期；采集、状态判定、陈旧判定共用 |
+| `sleep_s` | `60` | 鼠标驱动里的休眠档位；推导快探间隔（`sleep/3`，夹在 10 s–`tick_s`）与会话合并窗口 |
+| `offline_after_fails` | `2` | 失败次数下限。判离线还需同时满足静默 `max(2 × 快探, 30 s)`；设为 1 表示首次失败、静默够久就判 |
 | `history_interval_s` | `300` | 基线写入间隔（值未变化时的兜底采样） |
-| `history_days` | `30` | 历史保留天数，启动时清理 |
+| `data_max_mb` | `200` | 数据目录总量上限（16–10240 MB），启动时与每次跨日清理 |
 | `cycle_full_level` | `100` | 充电时达到此值才算"候选充满"（虚高问题见 §3.7） |
 | `cycle_min_charge_min` | `20` | 充电最短时长，不到则判 `partial`，防止虚高误判 |
 | `cycle_end_level` | `10` | 电量 ≤ 此值判定周期结束 |
 | `cycle_dead_hours` | `24` | 失联超过此时长判 `unknown_end`，不进平均 |
 | `data_dir` | `data` | **相对路径基于 exe 所在目录**（绿色版：数据全在程序文件夹内，不受启动时 CWD 影响）；CLI `--data-dir` / 环境变量例外，按 CWD 解释；不可写时回退 `%LOCALAPPDATA%\hidread\data` |
-| `log_file` | `null` | 追加写；不做滚动（避免引入额外依赖） |
+| `log_file` | `null` | 无控制台运行时的日志位置；`null` 表示 `data_dir/hidread.log`。相对路径同样基于 exe 目录；> 2 MB 时在启动阶段重开 |
 
 `config.json` 示例见 `config.example.json`（实现批次产出）。配置文件缺失时按默认值运行，不报错。
 
@@ -827,25 +831,26 @@ hidread/
 ├─ plugins/
 │  └─ MouseBattery.json          # §7.2 的成品
 ├─ src/
-│  ├─ main.rs                    # CLI 分发、单实例锁、日志
+│  ├─ main.rs                    # CLI 分发、单实例锁、日志、节拍循环
 │  ├─ config.rs                  # 三级优先级合并
 │  ├─ hid.rs                     # SetupAPI 枚举、CreateFileW、双句柄读写
 │  ├─ atk.rs                     # ATK1 帧构造/校验/解析（纯函数，可单测）
-│  ├─ state.rs                   # Snapshot + Mutex + 节拍状态
-│  ├─ link.rs                    # 在线状态机、唤醒/休眠事件
+│  ├─ app.rs                     # Snapshot/Link 状态 + 节拍引擎（采集 → 状态机 → 落盘）
 │  ├─ session.rs                 # 会话边界与时长、每日聚合
 │  ├─ cycle.rs                   # 放电周期状态机、续航统计
 │  ├─ history.rs                 # CSV 落盘/读取、保留期清理、24h 环形缓冲
-│  ├─ poller.rs                  # 节拍线程：采集 → 状态 → 落盘
-│  └─ http.rs                    # 12 个端点 + JSON 序列化
+│  ├─ tray.rs                    # 托盘图标与菜单
+│  ├─ autostart.rs               # HKCU Run 注册
+│  ├─ util.rs                    # 时间/时长/CSV 工具
+│  └─ http.rs                    # 16 个端点 + 设置页 + JSON/CSV 序列化
 ├─ data/                         # 运行时生成，加入 .gitignore
 │  ├─ history-YYYY-MM-DD.csv
 │  ├─ events-YYYY-MM-DD.csv
 │  ├─ sessions.csv
-│  ├─ sessions-state.json
+│  ├─ session-state.json
 │  ├─ cycles.csv
 │  └─ cycle-state.json
-└─ temp/hidread-设计方案.md       # 本文档
+└─ docs/hidread-设计方案.md       # 本文档
 ```
 
 ### 8.1 依赖
@@ -941,7 +946,7 @@ GET /battery:
 | 5 | 拔掉 dongle | `present:false`，有旧值则 200，服务不崩 |
 | 6 | 重插 dongle | 60 s 内自动恢复，无需重启 |
 | 7 | **插上充电线** | 记录 `rep[7]` 实际值 + 电量跳变幅度，回填 §2.4 与 §10 |
-| 8 | 开两个 `serve` | 第二个以退出码 2 拒绝启动 |
+| 8 | 开两个 `serve` | 第二个以退出码 0 直接退出并打印"已经在运行" |
 | 9 | LiteMonitor 添加插件 | 任务栏显示 `鼠标 15%`，低于 30% 变红 |
 | 10 | 静置 1 小时 | 历史每 5 min 一行基线，曲线连续；`/history` 点数与 CSV 行数一致 |
 | 11 | 等鼠标休眠（约 5 min 不动） | ≤120 s 内出 `offline` 事件；动一下 ≤120 s 恢复 `online`，`session_start_at` 刷新 |
@@ -977,7 +982,19 @@ GET /battery:
 
 ---
 
-## 11. 交付批次
+## 11. 版本策略
+
+遵循语义化版本，但在 **0.x 阶段**按下面的口径区分（patch 位可以到两位数，`0.2.10` 合法）：
+
+| 位 | 触发条件 | 例子 |
+|---|---|---|
+| patch | 修 bug、调文案、改样式，行为不变 | 0.3.1 → 0.3.2 |
+| minor | **行为/统计口径变更**、新增接口或配置项 | 0.2.9 → 0.3.0（判离线阈值从 100s 改为 40s） |
+| major | 数据格式不兼容、需手动迁移 | 未发生 |
+
+0.x 阶段允许较快地升 minor；进入 1.0 后再收紧。
+
+## 12. 交付批次
 
 | 批次 | 内容 | 验收方式 |
 |---|---|---|
@@ -991,7 +1008,7 @@ GET /battery:
 
 ---
 
-## 12. 范围外（记录，不实现）
+## 13. 范围外（记录，不实现）
 
 - 托盘菜单里的「立即读取一次 / 显示电量」等高级项
 - 数值平滑/滤波、掉电速率预测、电量校准
@@ -1081,3 +1098,47 @@ GET /battery:
 | 便携性 | — | `config.json` 与 `data/` 全部在 exe 同级目录；启动时预热最近 24h 历史，重启后曲线不空白 |
 
 未实现（明确范围外）：剩余时长预测、ATK2 协议、`0xFF06` 通道探测、托盘里的「立即读取一次」。
+
+## 附录 D · 存储选型（为什么不用 SQLite，2026-11-21）
+
+**结论：保持「按天 CSV + 目录体积上限」，不引入数据库。**
+
+### D.1 现状量级
+
+| 项 | 估算 |
+|---|---|
+| 采样 | 1 点/分钟 → 1440 行/天，约 60 KB/天 |
+| 会话 | 数十条/天，约 2 KB/天 |
+| 年增量 | < 30 MB（默认 200 MB 上限会自动清理最旧文件） |
+| 写入 | 单进程追加，从不改写已有行 |
+| 读取 | 按时间区间顺序扫（`/history`、`/week`） |
+
+### D.2 SQLite 的优势在这里全部落空
+
+- **索引**：查询只有「取最近 N 天」，顺序读本身就是最优路径；
+- **事务 / 并发**：单进程、只追加，没有并发写；
+- **部分更新**：不存在，清理是整文件删除；
+- **崩溃一致性**：按天分文件，坏一天不伤全局，比单库更稳。
+
+### D.3 引入它的代价
+
+- 依赖：`rusqlite` 需要 C 编译（或 bundled），构建时间与体积增加；
+- 可读性：CSV 能直接用 Excel 打开，数据库需要专门工具；
+- 备份：复制一天的文件 vs 整库快照。
+
+### D.4 什么时候才该换
+
+1. 需要**任意维度查询**（「所有超过 2 小时的会话」「按星期几统计」）；
+2. **多设备 / 多进程**并发写入；
+3. 数据量到 **GB 级**；
+4. 需要**事后修正**历史记录。
+
+### D.5 真要升级，建议 DuckDB 而非 SQLite
+
+- 列存 + 向量化聚合，分析型查询快 1–2 个数量级；
+- 可直接 `SELECT * FROM 'data/history-*.csv'`，**零迁移成本**；
+- 现有写文件逻辑不用改，随时可以叠加。
+
+### D.6 实测参考
+
+43 万行 / 33 MB 的 30 天合成数据，`/history?hours=720&max=1500` 全程 **1.5 秒**（含 CSV 解析 + 桶降采样）。真实使用量远小于此，当前方案没有性能压力。

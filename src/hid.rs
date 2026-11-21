@@ -245,6 +245,20 @@ pub struct Device {
 // 这里显式声明可跨线程传递（不会并发访问，锁在 App 层）。
 unsafe impl Send for Device {}
 
+/// 一次交换的结果。
+///
+/// `Err` 只表示 I/O 失败（句柄/设备多半已失效，调用方应丢弃句柄重开）；
+/// 鼠标休眠导致的"没有回复"是正常状态，用 `NoReply` 表达，句柄仍然可用。
+#[derive(Debug)]
+pub enum Exchange {
+    /// 校验通过的有效帧。
+    Valid(Vec<u8>),
+    /// 有回复但校验不通过（保留原始字节，便于日志/排障）。
+    Invalid(Vec<u8>),
+    /// 重试耗尽仍没有任何回复。
+    NoReply,
+}
+
 impl Device {
     pub fn open(iface: &HidIface) -> Result<Self> {
         let wide = to_wide(&iface.path);
@@ -302,7 +316,7 @@ impl Device {
         retries: u32,
         per_read: Duration,
         deadline: Duration,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Exchange> {
         let request = atk::request();
         let mut last: Option<Vec<u8>> = None;
 
@@ -318,7 +332,7 @@ impl Device {
                 match self.read_report(per_read) {
                     Ok(Some(buf)) => {
                         if atk::is_valid(&buf) {
-                            return Ok(buf);
+                            return Ok(Exchange::Valid(buf));
                         }
                         last = Some(buf);
                     }
@@ -328,12 +342,10 @@ impl Device {
             }
         }
 
-        match last {
-            Some(buf) => Ok(buf),
-            None => Err(anyhow!(
-                "设备没有给出有效回复（鼠标可能已休眠，动一下鼠标再试）"
-            )),
-        }
+        Ok(match last {
+            Some(buf) => Exchange::Invalid(buf),
+            None => Exchange::NoReply,
+        })
     }
 
     fn write_report(&self, data: &[u8]) -> Result<()> {

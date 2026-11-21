@@ -35,6 +35,7 @@ impl Session {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionStore {
     open: Option<Session>,
     next_id: u64,
@@ -48,7 +49,8 @@ impl SessionStore {
     pub fn load(cfg: &Config) -> Self {
         let mut store = Self {
             open: None,
-            next_id: 1,
+            // 状态文件丢了也不能和 sessions.csv 里已有的 id 重号
+            next_id: Self::max_id(cfg) + 1,
         };
         let Ok(text) = std::fs::read_to_string(cfg.session_state_path()) else {
             return store;
@@ -90,7 +92,7 @@ impl SessionStore {
             );
             let _ = util::append_line(&cfg.sessions_path(), &line);
             let _ = std::fs::remove_file(cfg.session_state_path());
-            store.next_id = id + 1;
+            store.next_id = store.next_id.max(id + 1);
             return store;
         }
 
@@ -100,8 +102,44 @@ impl SessionStore {
             sleep_at: None,
             end_reason: "ongoing".into(),
         });
-        store.next_id = id + 1;
+        store.next_id = store.next_id.max(id + 1);
         store
+    }
+
+    fn max_id(cfg: &Config) -> u64 {
+        util::read_rows(&cfg.sessions_path())
+            .iter()
+            .filter(|r| !r.is_empty() && r[0] != "session_id")
+            .filter_map(|r| r[0].parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 已结束的会话（按文件顺序，即开始时间顺序）。
+    fn closed(cfg: &Config) -> Vec<Session> {
+        util::read_rows(&cfg.sessions_path())
+            .into_iter()
+            .filter(|r| r.len() >= 7 && r[0] != "session_id")
+            .filter_map(|r| {
+                let wake_unix = r[2].parse::<i64>().ok()?;
+                let end_unix = r[4].parse::<i64>().ok()?;
+                Some(Session {
+                    id: r[0].parse().unwrap_or(0),
+                    wake_at: DateTime::from_timestamp(wake_unix, 0)?.with_timezone(&Local),
+                    sleep_at: Some(DateTime::from_timestamp(end_unix, 0)?.with_timezone(&Local)),
+                    end_reason: r[6].clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// 全部会话（含进行中的那条）。
+    fn all(&self, cfg: &Config) -> Vec<Session> {
+        let mut v = Self::closed(cfg);
+        if let Some(s) = &self.open {
+            v.push(s.clone());
+        }
+        v
     }
 
     pub fn current(&self) -> Option<&Session> {
@@ -161,31 +199,19 @@ impl SessionStore {
     }
 
     /// 某一天内开始的会话（含尚未结束的那条）。
-    pub fn for_day(&self, cfg: &Config, date: &str, now: DateTime<Local>) -> Vec<Session> {
-        let mut out: Vec<Session> = util::read_rows(&cfg.sessions_path())
+    pub fn for_day(&self, cfg: &Config, date: &str) -> Vec<Session> {
+        let Ok(day) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+            return Vec::new();
+        };
+        let mut out: Vec<Session> = Self::closed(cfg)
             .into_iter()
-            .filter(|r| r.len() >= 7 && r[0] != "session_id")
-            .filter(|r| r[1].starts_with(date))
-            .filter_map(|r| {
-                let wake_unix = r[2].parse::<i64>().ok()?;
-                let end_unix = r[4].parse::<i64>().ok()?;
-                Some(Session {
-                    id: r[0].parse().unwrap_or(0),
-                    wake_at: DateTime::from_timestamp(wake_unix, 0)?
-                        .with_timezone(&Local),
-                    sleep_at: Some(
-                        DateTime::from_timestamp(end_unix, 0)?.with_timezone(&Local),
-                    ),
-                    end_reason: r[6].clone(),
-                })
-            })
+            .filter(|s| s.wake_at.date_naive() == day)
             .collect();
 
         if let Some(s) = &self.open {
-            if s.wake_at.format("%Y-%m-%d").to_string() == date {
+            if s.wake_at.date_naive() == day {
                 let mut s = s.clone();
                 s.end_reason = "ongoing".into();
-                let _ = now;
                 out.push(s);
             }
         }
@@ -381,21 +407,59 @@ impl SessionStore {
     }
 
     /// 最近 `days` 天的每日聚合（含今天）。
+    ///
+    /// 时长口径与 `/week` 一致：按天裁剪，跨午夜的会话不会整段压在前一天。
+    /// `sessions` 计数仍按"开始日"归属，所以它与时长不是同一个分母。
     pub fn daily(&self, cfg: &Config, days: i64) -> Vec<Value> {
-        let now = Local::now();
+        self.daily_until(cfg, days, Local::now())
+    }
+
+    /// `now` 显式传入，便于测试固定"今天"。`daily` 只是它的当前时间版本。
+    fn daily_until(&self, cfg: &Config, days: i64, now: DateTime<Local>) -> Vec<Value> {
         let today = now.date_naive();
         let mut out = Vec::new();
+
+        // 只读一次 sessions.csv：之前是每天读一遍，90 天视图要读 90 次
+        let all = self.all(cfg);
+        let spans: Vec<(i64, i64)> = all
+            .iter()
+            .map(|s| {
+                let a = s.wake_at.timestamp();
+                (a, s.sleep_at.unwrap_or(now).timestamp().max(a))
+            })
+            .collect();
 
         for offset in (0..days.max(1)).rev() {
             let day = today - ChronoDuration::days(offset);
             let date = day.format("%Y-%m-%d").to_string();
-            let sessions = self.for_day(cfg, &date, now);
+            let Some(start) = day
+                .and_hms_opt(0, 0, 0)
+                .and_then(|d| d.and_local_timezone(Local).single())
+            else {
+                continue;
+            };
+            let d0 = start.timestamp();
+            let d1 = d0 + 86_400;
 
-            let online: i64 = sessions.iter().map(|s| s.duration_s(now)).sum();
-            let longest = sessions.iter().map(|s| s.duration_s(now)).max().unwrap_or(0);
+            let online: i64 = spans
+                .iter()
+                .map(|&(a, b)| (b.min(d1) - a.max(d0)).max(0))
+                .sum();
+
+            let sessions: Vec<&Session> = all
+                .iter()
+                .filter(|s| s.wake_at.date_naive() == day)
+                .collect();
+            let longest = sessions
+                .iter()
+                .map(|s| s.duration_s(now))
+                .max()
+                .unwrap_or(0);
             let first_wake = sessions
-                .first()
-                .map(|s| s.wake_at.format("%H:%M").to_string());
+                .iter()
+                .map(|s| s.wake_at)
+                .min()
+                .map(|t| t.format("%H:%M").to_string());
             let last_sleep = sessions
                 .iter()
                 .filter_map(|s| s.sleep_at)
@@ -404,20 +468,28 @@ impl SessionStore {
 
             let points = crate::history::History::load_range(
                 cfg,
-                day.and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_local_timezone(Local)
-                    .single()
-                    .unwrap_or(now),
+                start,
                 day.and_hms_opt(23, 59, 59)
-                    .unwrap()
-                    .and_local_timezone(Local)
-                    .single()
+                    .and_then(|d| d.and_local_timezone(Local).single())
                     .unwrap_or(now),
             );
 
             let levels: Vec<u8> = points.iter().filter_map(|p| p.level).collect();
-            let wired_samples = points.iter().filter(|p| p.wired).count() as i64;
+
+            // 有线时长按"相邻采样点的时间差"累计，而不是"行数 × tick"：
+            // 历史行只在值变化或基线间隔才写，稳定插线时行数远少于 tick 数。
+            let mut wired_s = 0i64;
+            for w in points.windows(2) {
+                if w[0].wired && w[0].online {
+                    let step = (w[1].at - w[0].at).num_seconds();
+                    wired_s += step.clamp(0, cfg.history_interval_s as i64);
+                }
+            }
+            if let Some(last) = points.last() {
+                if last.wired && last.online {
+                    wired_s += cfg.tick_s as i64;
+                }
+            }
 
             out.push(json!({
                 "date": date,
@@ -434,10 +506,77 @@ impl SessionStore {
                     "min": levels.iter().min(),
                     "max": levels.iter().max(),
                 },
-                "wired_s": wired_samples * cfg.tick_s as i64,
+                "wired_s": wired_s,
             }));
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(name: &str) -> Config {
+        let mut c = Config::default();
+        c.data_dir =
+            std::env::temp_dir().join(format!("hidread-session-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&c.data_dir);
+        std::fs::create_dir_all(&c.data_dir).unwrap();
+        c
+    }
+
+    fn at(day: chrono::NaiveDate, h: u32, m: u32) -> DateTime<Local> {
+        day.and_hms_opt(h, m, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn daily_clips_cross_midnight_sessions() {
+        let c = cfg("clip");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let w = at(day, 23, 0);
+        let e = at(day + ChronoDuration::days(1), 2, 0);
+        util::append_line(
+            &c.sessions_path(),
+            &format!(
+                "1,{},{},{},{},10800,no_reply",
+                util::rfc3339(w),
+                util::unix(w),
+                util::rfc3339(e),
+                util::unix(e)
+            ),
+        )
+        .unwrap();
+
+        let store = SessionStore::load(&c);
+        let days = store.daily_until(&c, 2, at(day + ChronoDuration::days(1), 12, 0));
+        assert_eq!(days[0]["date"], "2026-11-20");
+        assert_eq!(days[0]["online_s"], 3600, "23:00→24:00 只算 1 小时");
+        assert_eq!(days[1]["online_s"], 7200, "00:00→02:00 算 2 小时");
+        assert_eq!(days[0]["sessions"], 1);
+        assert_eq!(days[1]["sessions"], 0, "会话计数仍按开始日归属");
+    }
+
+    #[test]
+    fn wired_seconds_follow_sample_spacing() {
+        let c = cfg("wired");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        // 300s 一个基线点，全部有线在线：2 个间隔 × 300s + 末点 1 个 tick
+        for i in 0..3 {
+            let t = at(day, 10, 0) + ChronoDuration::seconds(i * 300);
+            util::append_line(
+                &c.history_path("2026-11-20"),
+                &format!("{},{},80,1,online,10", util::rfc3339(t), util::unix(t)),
+            )
+            .unwrap();
+        }
+        let store = SessionStore::load(&c);
+        let days = store.daily_until(&c, 1, at(day, 23, 0));
+        assert_eq!(days[0]["wired_s"], 660, "2×300s + 末点 60s");
     }
 }

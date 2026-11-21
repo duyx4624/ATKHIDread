@@ -44,7 +44,6 @@ struct Inner {
     cycles: CycleStore,
     history: History,
     last_tick: Option<DateTime<Local>>,
-    refreshing: bool,
 }
 
 struct Opened {
@@ -53,13 +52,17 @@ struct Opened {
 }
 
 enum TickResult {
-    Ok {
+    /// 有回复（校验是否通过由 `atk::parse` 再判）。
+    Reply {
         iface: hid::HidIface,
         raw: Vec<u8>,
         ms: u64,
     },
-    NoDevice(String),
+    /// 设备在，但没回复（多半在休眠）。句柄仍然可用，不要丢。
+    NoReply,
+    /// I/O 失败：句柄可能已失效（拔线/换模式），下次重新枚举。
     ReadError(String),
+    NoDevice(String),
 }
 
 pub struct App {
@@ -97,7 +100,6 @@ impl App {
             cycles: CycleStore::load(&cfg),
             history: History::new(),
             last_tick: None,
-            refreshing: false,
         };
 
         // 重启后立刻能画出 24h 曲线，不用等重新攒点
@@ -122,21 +124,29 @@ impl App {
         let now = Local::now();
 
         // 1. 系统挂起检测：PC 睡过一觉，不能用这段空档判定鼠标离线
-        {
+        let resume_gap = {
             let mut g = self.inner.lock().unwrap();
+            let mut gap_out = None;
             if let Some(prev) = g.last_tick {
                 let gap = (now - prev).num_seconds();
                 if gap > 3 * self.cfg.tick_s as i64 {
-                    self.event("host_resume", &format!("gap_s={gap}"));
                     if g.link.online {
-                        let _ = g.sessions.close(&self.cfg, prev, "host_suspend");
+                        // 用最后一次成功应答收尾，而不是上一次节拍起点：
+                        // 睡前鼠标可能已经先休眠，那几拍不该算在线
+                        let end = g.link.last_seen.unwrap_or(prev).min(now);
+                        let _ = g.sessions.close(&self.cfg, end, "host_suspend");
                     }
                     g.link.online = false;
                     g.link.fails = 0;
                     g.link.offline_since = None;
+                    gap_out = Some(gap);
                 }
             }
             g.last_tick = Some(now);
+            gap_out
+        };
+        if let Some(gap) = resume_gap {
+            self.event("host_resume", &format!("gap_s={gap}"));
         }
 
         // 2. 读设备（不持 inner 锁，最长约 2.4s）
@@ -147,7 +157,7 @@ impl App {
         let was_online = g.link.online;
 
         match result {
-            TickResult::Ok { iface, raw, ms } => {
+            TickResult::Reply { iface, raw, ms } => {
                 let info = match atk::parse(&raw) {
                     Some(v) => v,
                     None => {
@@ -182,7 +192,10 @@ impl App {
                 g.link.last_seen = Some(now);
                 g.link.offline_since = None;
 
-                if !was_online {
+                // 事件只在"真的开了新会话"时记：进程重启会恢复未结束的会话，
+                // 那不算一次 online 跳变（否则每重启一次事件流就多一条假 online）
+                let new_session = g.sessions.current().is_none();
+                if !was_online && new_session {
                     self.event("online", &format!("{:04X}:{:04X}", iface.vid, iface.pid));
                 }
 
@@ -203,6 +216,15 @@ impl App {
                 if let Err(e) = g.history.record(&self.cfg, point, !was_online) {
                     eprintln!("历史写入失败：{e:#}");
                 }
+            }
+            TickResult::NoReply => {
+                // 设备还在，只是没应答：保留句柄，避免每个休眠节拍都重新枚举 HID 接口
+                g.snapshot.present = true;
+                g.snapshot.error = Some(
+                    "设备没有给出有效回复（鼠标可能已休眠，动一下鼠标再试）".to_string(),
+                );
+                drop(g);
+                self.mark_failure(now);
             }
             TickResult::NoDevice(msg) => {
                 g.snapshot.present = false;
@@ -252,7 +274,8 @@ impl App {
             .last_seen
             .map(|t| (now - t).num_seconds())
             .unwrap_or(0);
-        let threshold = self.cfg.offline_after_fails.max(2);
+        // 配置允许 1（首次失败且静默够久就判离线），不要再静默抬到 2
+        let threshold = self.cfg.offline_after_fails.max(1);
 
         if g.link.online && silent >= limit && g.link.fails >= threshold {
             g.link.online = false;
@@ -306,11 +329,13 @@ impl App {
         let ms = start.elapsed().as_millis() as u64;
 
         match res {
-            Ok(raw) => TickResult::Ok {
+            Ok(hid::Exchange::Valid(raw)) | Ok(hid::Exchange::Invalid(raw)) => TickResult::Reply {
                 iface: opened.iface.clone(),
                 raw,
                 ms,
             },
+            // 只是没回复：鼠标休眠是常态，句柄留着，别每个节拍都重新枚举
+            Ok(hid::Exchange::NoReply) => TickResult::NoReply,
             Err(e) => {
                 // 句柄可能已失效（拔线/换模式），下次重新枚举
                 *slot = None;
@@ -416,7 +441,6 @@ impl App {
             "uptime_s": (now - self.started).num_seconds().max(0),
             "present": g.snapshot.present,
             "last_age_s": g.snapshot.updated_at.map(|t| (now - t).num_seconds()),
-            "refreshing": g.refreshing,
             "last_error": g.snapshot.error,
             "device": format!("{:04X}", self.cfg.vid),
         })
@@ -434,29 +458,38 @@ impl App {
 
     pub fn session_json(&self) -> Value {
         let now = Local::now();
-        let g = self.inner.lock().unwrap();
-        let online_s: i64 = g
-            .sessions
-            .for_day(&self.cfg, &now.format("%Y-%m-%d").to_string(), now)
+        // 只把内存字段拷出来，读文件的活儿放到锁外
+        let (online, fails, offline_since, start_at, store) = {
+            let g = self.inner.lock().unwrap();
+            (
+                g.link.online,
+                g.link.fails,
+                g.link.offline_since,
+                g.sessions.current().map(|x| x.wake_at),
+                g.sessions.clone(),
+            )
+        };
+        let online_s: i64 = store
+            .for_day(&self.cfg, &now.format("%Y-%m-%d").to_string())
             .iter()
             .map(|s| s.duration_s(now))
             .sum();
 
         json!({
-            "state": if g.link.online { "online" } else { "offline" },
-            "session_start_at": g.sessions.current().map(|x| util::rfc3339(x.wake_at)),
-            "session_uptime_s": g.sessions.current().map(|x| (now - x.wake_at).num_seconds()),
-            "session_uptime_text": g.sessions.current().map(|x| util::dur_text((now - x.wake_at).num_seconds())),
-            "offline_since": g.link.offline_since.map(util::rfc3339),
-            "consecutive_fails": g.link.fails,
+            "state": if online { "online" } else { "offline" },
+            "session_start_at": start_at.map(util::rfc3339),
+            "session_uptime_s": start_at.map(|t| (now - t).num_seconds()),
+            "session_uptime_text": start_at.map(|t| util::dur_text((now - t).num_seconds())),
+            "offline_since": offline_since.map(util::rfc3339),
+            "consecutive_fails": fails,
             "today": { "online_s": online_s, "online_text": util::dur_text(online_s) },
         })
     }
 
     pub fn sessions_json(&self, day: &str) -> Value {
         let now = Local::now();
-        let g = self.inner.lock().unwrap();
-        let list = g.sessions.for_day(&self.cfg, day, now);
+        let store = { self.inner.lock().unwrap().sessions.clone() };
+        let list = store.for_day(&self.cfg, day);
         let total: i64 = list.iter().map(|s| s.duration_s(now)).sum();
         json!({
             "day": day,
@@ -468,8 +501,8 @@ impl App {
     }
 
     pub fn daily_json(&self, days: i64) -> Value {
-        let g = self.inner.lock().unwrap();
-        json!({ "days": g.sessions.daily(&self.cfg, days) })
+        let store = { self.inner.lock().unwrap().sessions.clone() };
+        json!({ "days": store.daily(&self.cfg, days) })
     }
 
     /// 周视图：7 天的会话区间 + 自学习出来的时间轴范围。
@@ -491,8 +524,8 @@ impl App {
                 }
             });
 
-        let g = self.inner.lock().unwrap();
-        let (from_h, to_h) = g.sessions.active_range(&self.cfg, 30);
+        let store = { self.inner.lock().unwrap().sessions.clone() };
+        let (from_h, to_h) = store.active_range(&self.cfg, 30);
 
         // 业务日：每天从 04:00 到次日 03:59
         let day0 = start_date
@@ -501,12 +534,8 @@ impl App {
             .map(|d| d.timestamp())
             .unwrap_or(0);
         // 画图用合并区间（视觉连续），统计用原始区间（不把休眠算进时长）
-        let segs = g
-            .sessions
-            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now, true);
-        let raw = g
-            .sessions
-            .intervals_between(&self.cfg, day0, day0 + days * 86_400, now, false);
+        let segs = store.intervals_between(&self.cfg, day0, day0 + days * 86_400, now, true);
+        let raw = store.intervals_between(&self.cfg, day0, day0 + days * 86_400, now, false);
 
         let mut days_out = Vec::new();
         let mut total = 0i64;
@@ -548,36 +577,57 @@ impl App {
     }
 
     pub fn usage_json(&self, days: i64) -> Value {
-        let g = self.inner.lock().unwrap();
-        json!({ "days": g.sessions.usage(&self.cfg, days) })
+        let store = { self.inner.lock().unwrap().sessions.clone() };
+        json!({ "days": store.usage(&self.cfg, days) })
     }
 
     pub fn history_json(&self, hours: i64, max_points: usize) -> Value {
         let now = Local::now();
         let from = now - CDur::hours(hours);
-        let g = self.inner.lock().unwrap();
+        // 环的起点不晚于查询起点 → 完整覆盖这段窗口，不必读盘。
+        // 预热失败（环为空）或窗口超过环长时才回退到磁盘，磁盘只补环未覆盖的部分。
+        let (ring, covered) = {
+            let g = self.inner.lock().unwrap();
+            let ring: Vec<Point> = g
+                .history
+                .ring()
+                .iter()
+                .filter(|p| p.at >= from)
+                .cloned()
+                .collect();
+            let covered = g
+                .history
+                .ring()
+                .front()
+                .map(|p| p.at <= from)
+                .unwrap_or(false);
+            (ring, covered)
+        };
 
-        let ring: Vec<Point> = g
-            .history
-            .ring()
-            .iter()
-            .filter(|p| p.at >= from)
-            .cloned()
-            .collect();
-        // 磁盘是按天的真源，内存环只补"尚未落盘的最新点"。
-        // 之前优先用环，预热不完整时曲线只剩几个点（整张图空白）。
-        drop(g);
-        let mut points = History::load_range(&self.cfg, from, now);
-        match points.last() {
-            Some(last) => {
-                let last_at = last.at;
-                points.extend(ring.into_iter().filter(|p| p.at > last_at));
+        let points = if covered {
+            ring
+        } else {
+            let mut points = History::load_range(&self.cfg, from, now);
+            match points.last() {
+                Some(last) => {
+                    let last_at = last.at;
+                    points.extend(ring.into_iter().filter(|p| p.at > last_at));
+                }
+                None => points = ring,
             }
-            None => points = ring,
-        }
+            points
+        };
+
+        // 极值要在降采样之前算：桶平均会把 100%→5% 的尖峰抹成 52%
+        let levels: Vec<u8> = points.iter().filter_map(|p| p.level).collect();
+        let stats = json!({
+            "min": levels.iter().min(),
+            "max": levels.iter().max(),
+            "first": levels.first(),
+            "last": levels.last(),
+        });
 
         let points = History::downsample(points, max_points);
-        let levels: Vec<u8> = points.iter().filter_map(|p| p.level).collect();
         json!({
             "from": util::rfc3339(from),
             "to": util::rfc3339(now),
@@ -589,20 +639,18 @@ impl App {
                 "wired": if p.wired { 1 } else { 0 },
                 "link": if p.online { "online" } else { "offline" },
             })).collect::<Vec<_>>(),
-            "stats": {
-                "min": levels.iter().min(),
-                "max": levels.iter().max(),
-                "first": levels.first(),
-                "last": levels.last(),
-            },
+            "stats": stats,
         })
     }
 
     pub fn cycles_json(&self, limit: usize) -> Value {
         let now = Local::now();
-        let g = self.inner.lock().unwrap();
+        let (level, cycles) = {
+            let g = self.inner.lock().unwrap();
+            (g.snapshot.level, g.cycles.clone())
+        };
         json!({
-            "current": g.cycles.current_json(now, g.snapshot.level),
+            "current": cycles.current_json(now, level),
             "history": CycleStore::history(&self.cfg, limit),
             "stats": CycleStore::stats(&self.cfg),
         })

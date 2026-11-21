@@ -74,7 +74,17 @@ pub fn parse(reply: &[u8]) -> Option<Battery> {
 
 /// 把字节转成便于日志排障的十六进制串（小写、空格分隔）。
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // 写 String 不会失败
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
