@@ -27,17 +27,27 @@ pub fn run(url: String, notify: bool) -> Result<()> {
 
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false) // 左键留给双击打开页面，右键仍出菜单
         .with_tooltip("hidread — ATK 鼠标电量")
         .with_icon(battery_icon()?)
         .build()
         .context("创建托盘图标失败（explorer 未运行？）")?;
 
-    // 只有手动双击启动才提示；开机自启靠 --autostart 跳过
+    // 双击图标直接打开设置页
+    let url_open = url.clone();
+    std::thread::spawn(move || {
+        let rx = tray_icon::TrayIconEvent::receiver();
+        while let Ok(ev) = rx.recv() {
+            if matches!(ev, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+                open_url(&url_open);
+            }
+        }
+    });
+
+    // 只有手动双击启动才提示；开机自启靠 --autostart 跳过。
+    // 必须在本线程创建（消息循环随后在下方启动），不能另开线程。
     if notify {
-        let _ = crate::notice::balloon(
-            "hidread 已启动",
-            &format!("设置页 {url}\n右键托盘图标可打开、重启或退出"),
-        );
+        crate::notice::toast("hidread 已启动", &format!("设置页 {url}"), 4);
     }
 
     // 菜单事件单独一个线程，避免阻塞消息循环

@@ -31,6 +31,8 @@ cargo test                      # 25 项，3–5 秒
 cargo build --release           # 约 11 秒，链接阶段可能再等 1 分钟
 ```
 
+一键构建并打包：双击根目录的 `build.cmd`，或运行 `tools/build.ps1`。脚本会读 `Cargo.toml` 的版本号，生成 `dist/hidread-<版本>-win64.zip`，校验 exe 字节数，输出 SHA256，并清掉旧包。
+
 链接阶段卡在 `hidread(bin)` 是正常的：rustc 生成 811 KB exe + PDB，杀软要完整扫一遍，通常 1 分钟内结束。**不要因为这一步慢就去清缓存**，清完反而要全量重编。
 
 打包发布：把 `target/release/hidread.exe` 与 `使用说明.txt`、`config.example.json`、`plugins/` 放进 `dist/hidread-<版本>/`，压缩并记录 SHA256。

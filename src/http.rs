@@ -474,6 +474,14 @@ h1{font-size:18px;font-weight:600;margin:0}
 .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:999px;transition:width .3s}
 form{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px 18px 18px}
 fieldset{border:0;border-top:1px solid var(--line);margin:0;padding:14px 0 6px}
+details.fold{margin-top:16px;border:1px solid var(--line);border-radius:10px;background:#fff;overflow:hidden}
+details.fold>summary{cursor:pointer;list-style:none;padding:11px 14px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;user-select:none}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:'\25B8';color:var(--sub);font-size:11px;transition:transform .15s}
+details.fold[open]>summary::before{transform:rotate(90deg)}
+details.fold>summary .sub{font-weight:400;color:var(--sub);font-size:12px}
+details.fold>form{padding:0 14px 14px}
+details.fold>form>fieldset:first-of-type{border-top:0}
 fieldset:first-of-type{border-top:0}
 legend{font-size:12px;color:var(--sub);padding:0 6px 0 0;letter-spacing:.02em}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px 18px}
@@ -566,6 +574,8 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
   </div>
 </section>
 
+<details class="fold" id="fold">
+  <summary>设置<span class="sub">采集 · 记录 · 周期 · 服务</span></summary>
 <form id="f">
   <fieldset><legend>采集</legend><div class="grid">
     <label>采样节拍（秒）<input type="number" data-key="tick_s" min="5" max="3600">
@@ -627,6 +637,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
     <span class="msg" id="msg">保存后服务会自动重启，约 1 秒</span>
   </div>
 </form>
+</details>
 
 <footer>
   <a href="/chart?hours=24">电量曲线</a>

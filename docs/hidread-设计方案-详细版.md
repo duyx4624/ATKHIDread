@@ -523,7 +523,7 @@ if now - last_tick > 3 * tick_s:
 ### 4.3 `GET /health`
 
 ```json
-{ "ok": true, "version": "0.2.5", "uptime_s": 3120, "present": true,
+{ "ok": true, "version": "0.2.6", "uptime_s": 3120, "present": true,
   "last_age_s": 42, "last_error": null }
 ```
 
