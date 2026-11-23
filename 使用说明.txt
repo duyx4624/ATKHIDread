@@ -1,4 +1,4 @@
-hidread 0.2.6
+hidread 0.2.7
 ATK X1 Ultimate 2.0（2.4G）鼠标电量读取与本地 HTTP 桥接
 
 一、运行

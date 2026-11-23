@@ -529,7 +529,7 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 .heat-sum{font-size:12px;color:var(--sub);margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
 #modal{position:fixed;inset:0;background:rgba(17,24,39,.45);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
 #modal.show{display:flex}
-.modal-box{background:#fff;border-radius:14px;padding:16px 20px 20px;width:min(94vw,1000px);max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.28)}
+.modal-box{background:#fff;border-radius:14px;padding:16px 20px 20px;width:min(94vw,1400px);max-height:88vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.28)}
 .modal-box h3{margin:0 0 14px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px}
 .modal-box h3 button{all:unset;cursor:pointer;color:var(--sub);font-size:20px;line-height:1;padding:0 6px}
 .modal-box table{width:100%;border-collapse:collapse;font-size:12px}
@@ -651,6 +651,11 @@ footer a{color:var(--accent);text-decoration:none;margin-right:10px}
 <div id="modal"><div class="modal-box"><h3><span id="modal-title"></span><button id="modal-close" title="关闭">×</button></h3><div id="modal-body"></div></div></div>
 <div id="toast"></div>
 <script>
+function fieldLabel(el){
+  const lab=el.closest('label'),node=lab&&lab.firstChild;
+  const t=node&&node.nodeValue?node.nodeValue.trim():'';
+  return t||el.dataset.key;
+}
 const numKeys=new Set(['port','sleep_s','tick_s','offline_after_fails','history_interval_s','data_max_mb','cycle_full_level','cycle_min_charge_min','cycle_end_level','cycle_dead_hours','read_timeout_ms','read_deadline_ms','retries']);
 const fields=[...document.querySelectorAll('[data-key]')];
 const $=id=>document.getElementById(id);
@@ -683,7 +688,6 @@ function refreshOfflineHint(){
   const probe=Math.min(Math.max(Math.floor(sleep/3),10),Math.max(tick,5));
   const quiet=Math.max(probe*2,30);
   // 从最后一次成功读取算起：首次失败最多要等一个节拍，之后每 probe 秒确认一次
-  const est=Math.max(quiet,tick)+(fails-1)*probe;
   const lo=Math.max(quiet,tick);
   const hi=lo+(fails-1)*probe;
   const range=hi>lo?(lo+'~'+hi+'s'):(lo+'s');
@@ -724,7 +728,16 @@ $('f').addEventListener('submit',async e=>{
     const k=el.dataset.key;
     if(el.type==='checkbox') body[k]=el.checked;
     else if(k==='pids') body[k]=el.value.split(',').map(s=>s.trim()).filter(Boolean);
-    else if(numKeys.has(k)) body[k]=Number(el.value);
+    else if(numKeys.has(k)){
+      const raw=el.value.trim(),num=Number(raw);
+      if(raw===''||!Number.isFinite(num)){
+        $('msg').textContent='「'+fieldLabel(el)+'」不能为空，请填数字';
+        $('msg').className='msg err';
+        el.focus();
+        return;
+      }
+      body[k]=num;
+    }
     else body[k]=el.value.trim();
   }
   $('save').disabled=true; $('msg').textContent='保存中…'; $('msg').className='msg';
@@ -753,7 +766,7 @@ $('f').addEventListener('submit',async e=>{
 // ---------- 缩略图 / 放大 ----------
 let dailyCache=[];
 let curveHours=7;
-let weekCur=null, lastWeek=null;
+let lastWeek=null, weekAbort=null;
 const CURVE_RANGES=[1,3,7,30];
 const WK=['一','二','三','四','五','六','日'];
 function fitCanvas(cv,h){
@@ -811,7 +824,15 @@ function drawCurve(cv,points,axes){
     if(span>48){ stepH=Math.max(24,Math.ceil(span/8/24)*24); dateLabel=true; }
     else if(span>12){ stepH=12; }
     ctx.textAlign='center';
-    for(let t=t0;t<=t1;t+=stepH*3600){
+    // 日期标签从当天 0 点起排，与下面每天的分隔线对齐
+    let startT=t0;
+    if(dateLabel){
+      const d0=new Date(t0*1000);
+      d0.setHours(0,0,0,0);
+      if(d0.getTime()/1000<t0)d0.setDate(d0.getDate()+1);
+      startT=d0.getTime()/1000;
+    }
+    for(let t=startT;t<=t1;t+=stepH*3600){
       const dd=new Date(t*1000);
       ctx.strokeStyle='#f3f6f9';ctx.beginPath();ctx.moveTo(x(t),padT);ctx.lineTo(x(t),H-padB);ctx.stroke();
       ctx.fillStyle='#8b98a5';
@@ -819,6 +840,25 @@ function drawCurve(cv,points,axes){
         ?String(dd.getMonth()+1).padStart(2,'0')+'-'+String(dd.getDate()).padStart(2,'0')
         :String(dd.getHours()).padStart(2,'0')+':00';
       ctx.fillText(lbl,x(t),H-6);
+    }
+
+    // 每天 0 点的分隔线：让跨天的曲线一眼能切开
+    if((t1-t0)/3600>24){
+      ctx.save();
+      ctx.strokeStyle='#c2d1e2';
+      ctx.lineWidth=1;
+      ctx.setLineDash([4,4]);
+      const d=new Date(t0*1000);
+      d.setHours(0,0,0,0);
+      if(d.getTime()/1000<t0)d.setDate(d.getDate()+1);
+      for(;d.getTime()/1000<=t1;d.setDate(d.getDate()+1)){
+        const px=x(d.getTime()/1000);
+        ctx.beginPath();
+        ctx.moveTo(px,padT);
+        ctx.lineTo(px,H-padB);
+        ctx.stroke();
+      }
+      ctx.restore();
     }
   }
 
@@ -1031,15 +1071,22 @@ function drawWeek(cv,week,height,opts){
   if(opts.hover)mountWeekHover(cv);
 }
 // 30 天宽视图：左侧固定时间轴 + 右侧横向拖动
-function drawWeekWide(host,week){
+function drawWeekWide(host,week,opts){
+  opts = opts || {};
   const axis=host.querySelector('#week-axis');
   const cv=host.querySelector('#week-big');
-  const height=520,padT=46,padB=10,colW=34;
+  const sc=host.querySelector('#week-scroll');
+  // 高度跟着窗口走：大屏更长，小屏不溢出
+  const height=Math.min(780,Math.max(500,window.innerHeight-200)),padT=46,padB=10;
   const dpr=window.devicePixelRatio||1;
   const cols=week.days.length;
   const from=week.range.from,to=week.range.to,span=Math.max(1,to-from);
   const plotH=height-padT-padB;
-
+  // 获取右侧滚动容器的宽度（如果没有，则用总宽减去左侧时间轴的 42px）
+  const availW = sc.clientWidth || (host.clientWidth - 42);
+  // 最小列宽 34px，如果空间足够则自动拉宽填满
+  const colW = Math.max(34, Math.floor(availW / cols));
+  const W = cols * colW;
   axis.width=Math.round(42*dpr);axis.height=Math.round(height*dpr);
   axis.style.height=height+'px';
   const ax=axis.getContext('2d');ax.setTransform(dpr,0,0,dpr,0,0);ax.clearRect(0,0,42,height);
@@ -1050,7 +1097,6 @@ function drawWeekWide(host,week){
     ax.fillText(hourLabel(h),36,padT+(h-from)/span*plotH);
   }
 
-  const W=cols*colW;
   cv.width=Math.round(W*dpr);cv.height=Math.round(height*dpr);
   cv.style.width=W+'px';cv.style.height=height+'px';
   const ctx=cv.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
@@ -1109,8 +1155,9 @@ function drawWeekWide(host,week){
   cv._wkBlocks=blocks;
   mountWeekWideHover(host,cv);
   // 默认停在最右：打开就看到最近几天
-  const sc=host.querySelector('#week-scroll');
-  requestAnimationFrame(()=>{sc.scrollLeft=sc.scrollWidth;});
+  if (!opts.keepScroll) {
+    requestAnimationFrame(()=>{sc.scrollLeft=sc.scrollWidth;});
+  }
 }
 function mountWeekWideHover(host,cv){
   const sc=host.querySelector('#week-scroll');
@@ -1128,11 +1175,13 @@ function mountWeekWideHover(host,cv){
   };
   cv.onmouseleave=()=>{tip.style.display='none';};
 
-  // 按住拖动 / 滚轮横向滚动
+  // 按住拖动 / 滚轮横向滚动；用 AbortController 统一摘除，避免弹窗关掉后还挂在 document 上
+  if(weekAbort)weekAbort.abort();
+  weekAbort=new AbortController();
   let down=false,sx=0,sl=0;
   sc.onmousedown=e=>{down=true;sx=e.clientX;sl=sc.scrollLeft;sc.classList.add('dragging');e.preventDefault();};
-  document.onmouseup=()=>{down=false;sc.classList.remove('dragging');};
-  document.onmousemove=e=>{if(down)sc.scrollLeft=sl-(e.clientX-sx);};
+  document.addEventListener('mouseup',()=>{down=false;sc.classList.remove('dragging');},{signal:weekAbort.signal});
+  document.addEventListener('mousemove',e=>{if(down)sc.scrollLeft=sl-(e.clientX-sx);},{signal:weekAbort.signal});
   sc.onwheel=e=>{if(e.deltaY&&!e.deltaX){sc.scrollLeft+=e.deltaY;e.preventDefault();}};
 }
 function fitOn(cv,fn){
@@ -1182,7 +1231,7 @@ async function loadPanels(){
     dailyCache=d.days.slice().reverse();
     drawCurve($('curve-thumb'),h.points,false);
     renderDaily($('daily-body'),dailyCache,false);
-    weekCur=w.start;lastWeek=w;
+    lastWeek=w;
     drawWeek($('week-thumb'),w,280,{});
     fitOn($('week-thumb'),()=>{if(lastWeek)drawWeek($('week-thumb'),lastWeek,280,{});});
     $('week-sum').textContent='本周合计 '+fmtDur(w.total_s)+' · 每天平均 '+fmtDur(Math.round(w.total_s/7))
@@ -1195,7 +1244,12 @@ function openModal(title,build){
   $('modal').classList.add('show');
   build(body);
 }
-function closeModal(){$('modal').classList.remove('show');}
+function closeModal(){
+  $('modal').classList.remove('show');
+  if(weekAbort){weekAbort.abort();weekAbort=null;}
+  const host = document.getElementById('week-body');
+  if (host && host._ro) { host._ro.disconnect(); host._ro = null; }
+}
 $('modal-close').addEventListener('click',closeModal);
 $('modal').addEventListener('click',e=>{if(e.target.id==='modal')closeModal();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
@@ -1241,13 +1295,23 @@ async function zoom(kind,range){
         +'<i style="background:#e5533d;height:2px;border-radius:1px"></i>当前时间'
         +'</div>';
       fetch('/week?days=30',{cache:'no-store'}).then(r=>r.json()).then(w=>{
-        weekCur=w.start;
         $('wk-label').textContent=w.start+' ~ '+w.end;
         $('wk-sum2').textContent='合计 '+fmtDur(w.total_s)
           +' · 活跃 '+hourLabel(w.range.from)+'–'+hourLabel(w.range.to);
         const host=body.querySelector('#week-body');
         drawWeekWide(host,w);
-        fitOn(host.querySelector('#week-axis'),()=>drawWeekWide(host,w));
+        if (host._ro) host._ro.disconnect();
+        let timer = null;
+        host._ro = new ResizeObserver(() => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            const sc = host.querySelector('#week-scroll');
+            const keep = sc ? sc.scrollLeft : 0;
+            drawWeekWide(host, w, {keepScroll: true});
+            if (sc) sc.scrollLeft = keep;
+          }, 100);
+        });
+        host._ro.observe(host);
       });
     });
   }
@@ -1286,14 +1350,23 @@ setInterval(loadStatus,5000);
 </script></body></html>"##;
 
 fn chart_html(hours: i64) -> String {
+    // 与路由层的 int_param 上限一致（30 天）；这里是二次防御
+    let hours = hours.clamp(1, 24 * 30);
     format!(
-        r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>hidread 电量</title>
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hidread 电量</title>
 <style>
 body{{font:13px/1.5 system-ui,sans-serif;margin:24px;color:#111;background:#fff}}
 canvas{{width:100%;height:320px;border:1px solid #dde3ea;border-radius:8px}}
 .legend{{color:#5b6b7c;margin:8px 0}}
 a{{color:#185fa5;text-decoration:none}}
 </style>
+</head>
+<body>
 <p><a href="/">← 返回设置</a></p>
 <h2 style="font-size:15px;font-weight:500;margin:0 0 4px">最近 {hours} 小时电量</h2>
 <div class="legend">实线＝无线（放电）；虚线＝有线（读数虚高，不可当真）</div>
@@ -1302,33 +1375,45 @@ a{{color:#185fa5;text-decoration:none}}
 const cv=document.getElementById('c'),ctx=cv.getContext('2d');
 function draw(d){{
   const dpr=window.devicePixelRatio||1;
-  cv.width=cv.clientWidth*dpr;cv.height=cv.clientHeight*dpr;ctx.scale(dpr,dpr);
-  const W=cv.clientWidth,H=cv.clientHeight,pad=32;
+  const W=cv.clientWidth,H=cv.clientHeight;
+  // 用 setTransform 而不是 scale：重复绘制时才不会把缩放累乘上去
+  cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,W,H);
+  const pad=32;
   const pts=d.points.filter(p=>p.level!==null);
   if(!pts.length){{ctx.fillStyle='#888';ctx.fillText('暂无数据',pad,pad);return}}
-  const t0=d.points[0].t,t1=d.points[d.points.length-1].t||t0+1;
+  const t0=pts[0].t,t1=pts[pts.length-1].t||t0+1;
   const x=t=>pad+(t-t0)/(t1-t0||1)*(W-pad*2);
   const y=v=>H-pad-(v/100)*(H-pad*2);
   ctx.strokeStyle='#eef1f5';ctx.lineWidth=1;
   for(let v=0;v<=100;v+=25){{ctx.beginPath();ctx.moveTo(pad,y(v));ctx.lineTo(W-pad,y(v));ctx.stroke();
     ctx.fillStyle='#8b98a5';ctx.fillText(v+'%',6,y(v)+4)}}
-  let prev=null;
-  for(const p of d.points){{
-    if(p.level===null){{prev=null;continue}}
-    if(prev){{
-      ctx.beginPath();ctx.moveTo(x(prev.t),y(prev.level));ctx.lineTo(x(p.t),y(p.level));
-      ctx.setLineDash(p.wired?'4 3':[]);
-      ctx.strokeStyle=p.wired?'#ba7517':'#185fa5';ctx.lineWidth=1.5;ctx.stroke();
-    }}
-    prev=p;
+  // 超过约 3 个采样间隔就断开：程序停机几天时不会拉出一条假直线
+  const gapLimit=Math.max(1,(t1-t0)/Math.max(1,pts.length))*3;
+  for(let i=1;i<pts.length;i++){{
+    const a=pts[i-1],b=pts[i];
+    if(b.t-a.t>gapLimit)continue;
+    ctx.beginPath();ctx.moveTo(x(a.t),y(a.level));ctx.lineTo(x(b.t),y(b.level));
+    ctx.setLineDash(b.wired?[4,3]:[]);
+    ctx.strokeStyle=b.wired?'#ba7517':'#185fa5';ctx.lineWidth=1.5;ctx.stroke();
   }}
   ctx.setLineDash([]);
+  // 孤立点（前后都断开）用淡色圆点标出，否则它在图上什么都看不到
+  ctx.fillStyle='rgba(24,95,165,.45)';
+  for(let i=0;i<pts.length;i++){{
+    const a=pts[i-1],b=pts[i+1];
+    const gapA=!a||pts[i].t-a.t>gapLimit;
+    const gapB=!b||b.t-pts[i].t>gapLimit;
+    if(gapA&&gapB){{ctx.beginPath();ctx.arc(x(pts[i].t),y(pts[i].level),1.8,0,Math.PI*2);ctx.fill();}}
+  }}
 }}
 fetch('/history?hours={hours}').then(r=>r.json()).then(draw).catch(e=>{{
   document.getElementById('c').outerHTML='<pre>加载失败：'+e+'</pre>';
 }});
-</script></html>"#
+</script>
+</body>
+</html>"#
     )
 }
 

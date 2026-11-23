@@ -94,7 +94,7 @@ unsafe fn paint(hwnd: HWND, hdc: HDC) {
     let _ = SetBkMode(hdc, TRANSPARENT);
     // 用微软雅黑 + ClearType，避免默认点阵字体的锯齿感
     let face = wide("Microsoft YaHei UI");
-    let mut font = CreateFontW(
+    let font = CreateFontW(
         -14,
         0,
         0,

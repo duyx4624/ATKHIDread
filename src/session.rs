@@ -281,7 +281,9 @@ impl SessionStore {
 
         // 两端各留余量；若活跃只到 24:00 之前，就不必把次日凌晨也画进来
         let mut from = f.saturating_sub(1);
-        let mut to = if last <= 20 {
+        // last 是小时索引：20 表示 00:00–01:00。之前写成 `<= 20` 会把
+        // 凌晨 0 点后的活动压回 20（00:00），导致 00:13 的会话在图上被裁掉。
+        let mut to = if last < 20 {
             (last + 2).min(20)
         } else {
             (last + 2).min(24)
